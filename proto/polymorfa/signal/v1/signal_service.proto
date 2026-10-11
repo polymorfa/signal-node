@@ -1,0 +1,414 @@
+// Contract between Polymorfa's WhatsApp runner and a customer-run Signal
+// service for zero-knowledge (ZK) sessions.
+//
+// The Signal service holds a linked device's Signal private keys, sessions
+// and message plaintext. Polymorfa keeps the WhatsApp connection and asks the
+// service for every operation that needs a private key. Plaintext never
+// crosses this contract, with one exception: an app-state key share received
+// from one of the account's own devices (ReceiveResult.app_state_key_share).
+//
+// Transport
+// - The Signal service dials out: a WebSocket to Polymorfa with subprotocol
+//   "polymorfa.signal.v1", authenticated with a project credential in the
+//   Authorization header. Polymorfa never connects to the service.
+// - Each binary WebSocket message is exactly one Frame.
+// - Both sides send requests. A request carries an id unique per sender per
+//   connection; its response or Error carries the same id. Requests may be
+//   answered out of order.
+// - One connection serves any number of sessions. Every session-scoped
+//   request names the session and the lease generation it was sent under.
+//
+// Leases and fencing
+// - Before Polymorfa routes a session's operations to a connection, the
+//   service claims the session with ClaimSession, giving the generation of
+//   the lease it holds in its own store. Polymorfa routes the session to the
+//   highest generation it has accepted and rejects claims and requests at a
+//   lower generation with CODE_NOT_LEASE_HOLDER.
+// - While no connection holds a session, the session is paused: Polymorfa
+//   stops reading messages for it and resumes when a service claims it.
+//
+// Versioning
+// - Hello.protocol_version and Welcome.protocol_version must match. Fields
+//   are only ever added; a side that receives an unknown oneof case answers
+//   with Error{code: CODE_UNSUPPORTED}.
+syntax = "proto3";
+
+package polymorfa.signal.v1;
+
+option go_package = "github.com/polymorfa/polymorfa/apps/api/gen/proto/polymorfa/signal/v1;signalv1";
+
+// Frame is one WebSocket message.
+message Frame {
+  // Request id, or the id of the request this frame answers. Zero for
+  // Hello, Welcome and SessionEvent.
+  uint64 id = 1;
+
+  oneof body {
+    // Service → Polymorfa. The first frame on a connection.
+    Hello hello = 2;
+    // Polymorfa → service. Answers Hello.
+    Welcome welcome = 3;
+    // Polymorfa → service.
+    RunnerRequest runner_request = 4;
+    // Service → Polymorfa. Answers a RunnerRequest.
+    ServiceResponse service_response = 5;
+    // Service → Polymorfa.
+    ServiceRequest service_request = 6;
+    // Polymorfa → service. Answers a ServiceRequest.
+    RunnerResponse runner_response = 7;
+    // Either direction. Answers a request that failed.
+    Error error = 8;
+    // Polymorfa → service. Unsolicited; never answered.
+    SessionEvent session_event = 9;
+  }
+}
+
+message Hello {
+  // 1 for this contract.
+  uint32 protocol_version = 1;
+  // Free-form build identifier of the Signal service, for diagnostics.
+  string service_version = 2;
+  // Stable identifier of this service node, for diagnostics.
+  string node_id = 3;
+}
+
+message Welcome {
+  uint32 protocol_version = 1;
+  // Project the credential belongs to. Sessions outside it are refused.
+  string project_id = 2;
+  // The service sends a Ping at least this often; Polymorfa closes a silent
+  // connection after three intervals.
+  uint32 heartbeat_interval_ms = 3;
+  // Ceiling on SendStanza requests per session per second.
+  uint32 max_sends_per_second = 4;
+}
+
+// RunnerRequest is an operation Polymorfa's runner needs from the service.
+message RunnerRequest {
+  string session_id = 1;
+  uint64 lease_generation = 2;
+
+  oneof op {
+    Receive receive = 10;
+    GeneratePreKeys generate_pre_keys = 11;
+    MarkPreKeysUploaded mark_pre_keys_uploaded = 12;
+    UploadedPreKeyCount uploaded_pre_key_count = 13;
+    GetIdentity get_identity = 14;
+    SignPairing sign_pairing = 15;
+    SetOwnJids set_own_jids = 16;
+    Resend resend = 17;
+    ForgetIdentity forget_identity = 18;
+    MigratePnToLid migrate_pn_to_lid = 19;
+  }
+}
+
+message ServiceResponse {
+  oneof result {
+    // For operations with no result.
+    Ok ok = 10;
+    ReceiveResult receive = 11;
+    PreKeys pre_keys = 12;
+    PreKeyCount pre_key_count = 13;
+    Identity identity = 14;
+    SignedPairing signed_pairing = 15;
+    Stanza stanza = 16;
+    MigrateResult migrate = 17;
+  }
+}
+
+// ServiceRequest is something the service needs from Polymorfa, chiefly to
+// send messages it built.
+message ServiceRequest {
+  string session_id = 1;
+  // Zero for ClaimSession and Ping.
+  uint64 lease_generation = 2;
+
+  oneof op {
+    ClaimSession claim_session = 10;
+    ReleaseSession release_session = 11;
+    SendStanza send_stanza = 12;
+    ResolveDevices resolve_devices = 13;
+    FetchPreKeys fetch_pre_keys = 14;
+    ResolveGroup resolve_group = 15;
+    Ping ping = 16;
+  }
+}
+
+message RunnerResponse {
+  oneof result {
+    Ok ok = 10;
+    SessionClaimed session_claimed = 11;
+    SendResult send = 12;
+    Devices devices = 13;
+    Bundles bundles = 14;
+    GroupRouting group_routing = 15;
+  }
+}
+
+message Error {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    // Unexpected failure; the request may be retried.
+    CODE_INTERNAL = 1;
+    // A dependency is down (database, WhatsApp connection). Retry later.
+    CODE_UNAVAILABLE = 2;
+    CODE_INVALID_ARGUMENT = 3;
+    // The request's lease generation is not the current one for the session.
+    CODE_NOT_LEASE_HOLDER = 4;
+    // Receive only: the payload could not be decrypted. See decrypt_failure.
+    CODE_DECRYPT_FAILED = 5;
+    // The receiver does not implement this operation.
+    CODE_UNSUPPORTED = 6;
+    // SendStanza exceeded Welcome.max_sends_per_second.
+    CODE_RATE_LIMITED = 7;
+    // The session is not paired, logged out, or not in this project.
+    CODE_SESSION_UNAVAILABLE = 8;
+    // The operation is refused for zero-knowledge sessions (for example a
+    // Campaign send).
+    CODE_REFUSED = 9;
+  }
+  Code code = 1;
+  // Diagnostic text. Never contains key material or message content.
+  string message = 2;
+  // Set when code is CODE_DECRYPT_FAILED.
+  DecryptFailure decrypt_failure = 3;
+}
+
+enum DecryptFailure {
+  // Any other failure; the runner sends a retry receipt.
+  DECRYPT_FAILURE_UNSPECIFIED = 0;
+  // Older than the session can decrypt; ignore the payload.
+  DECRYPT_FAILURE_OLD_COUNTER = 1;
+  // Group message without a sender key.
+  DECRYPT_FAILURE_NO_SENDER_KEY = 2;
+  // Decrypted but not a valid message.
+  DECRYPT_FAILURE_UNDECODABLE = 3;
+}
+
+message Ok {}
+
+// ─── Runner → service operations ────────────────────────────────────────
+
+// Receive hands over one <enc> payload. The service decrypts it, processes
+// protocol content itself and delivers the message to the customer's
+// application. Idempotent per (chat, sender, message_id, kind): a repeat
+// returns the first result with redelivered set, until the service records
+// delivery, after which it returns already_delivered.
+message Receive {
+  string chat = 1;
+  // Encryption JID of the sender device (LID where known).
+  string sender = 2;
+  string message_id = 3;
+  // "pkmsg", "msg" or "skmsg".
+  string kind = 4;
+  bytes ciphertext = 5;
+  // The <enc v> attribute.
+  int32 padding_version = 6;
+  bool is_from_me = 7;
+  // Message timestamp, seconds.
+  int64 timestamp = 8;
+  // Sender's alternate JID (PN for a LID sender and vice versa), if known.
+  string sender_alt = 9;
+}
+
+message ReceiveResult {
+  bool already_delivered = 1;
+  bool redelivered = 2;
+  bool sender_key_rejected = 3;
+  // Serialized waE2E.AppStateSyncKeyShare. Set only for shares from this
+  // account's own devices.
+  bytes app_state_key_share = 4;
+}
+
+message GeneratePreKeys {
+  uint32 count = 1;
+}
+
+message PreKeys {
+  repeated PreKey pre_keys = 1;
+}
+
+message PreKey {
+  uint32 id = 1;
+  // 32-byte Curve25519 public key.
+  bytes public_key = 2;
+}
+
+message MarkPreKeysUploaded {
+  repeated uint32 ids = 1;
+}
+
+message UploadedPreKeyCount {}
+
+message PreKeyCount {
+  uint32 count = 1;
+}
+
+// GetIdentity returns the device's public registration material, creating
+// the device keys on first use.
+message GetIdentity {}
+
+message Identity {
+  uint32 registration_id = 1;
+  // 32-byte public keys.
+  bytes identity_key = 2;
+  uint32 signed_pre_key_id = 3;
+  bytes signed_pre_key = 4;
+  // 64-byte XEdDSA signature of the signed prekey.
+  bytes signed_pre_key_signature = 5;
+  // 32-byte pairing HMAC key for the QR code. Authenticates pairing only.
+  bytes adv_secret = 6;
+}
+
+// SignPairing verifies the primary's pair-success container and signs it
+// with the device identity key.
+message SignPairing {
+  // Serialized ADVSignedDeviceIdentityHMAC from the pair-success stanza.
+  bytes device_identity_container = 1;
+}
+
+message SignedPairing {
+  // Serialized ADVSignedDeviceIdentity with the device signature added.
+  bytes signed_device_identity = 1;
+}
+
+message SetOwnJids {
+  string pn = 1;
+  string lid = 2;
+}
+
+// Resend answers a retry receipt: the service re-encrypts a message it sent,
+// from its own record of it, and returns the finished stanza.
+message Resend {
+  string chat = 1;
+  string message_id = 2;
+  string requester = 3;
+  string encryption_jid = 4;
+  // Original chat user when the requester is one of the account's own
+  // devices on a direct message.
+  string recipient = 5;
+  bool is_group = 6;
+  bool is_broadcast = 7;
+  // "pn" or "lid"; empty when not a group.
+  string addressing_mode = 8;
+  uint32 retry_count = 9;
+  // Keys carried by the retry receipt, to start a fresh session.
+  Bundle bundle = 10;
+}
+
+message Stanza {
+  // Marshaled binary node, ready to send.
+  bytes node = 1;
+}
+
+message ForgetIdentity {
+  // User JID (no device). Covers the user's hosted devices too.
+  string user = 1;
+}
+
+message MigratePnToLid {
+  string pn = 1;
+  string lid = 2;
+}
+
+message MigrateResult {
+  uint32 moved = 1;
+}
+
+// ─── Service → runner operations ────────────────────────────────────────
+
+message ClaimSession {
+  // Generation of the lease the service holds in its own store. Must be
+  // greater than or equal to any generation Polymorfa accepted before.
+  uint64 generation = 1;
+}
+
+message SessionClaimed {
+  // Polymorfa's view of the session when the claim was accepted.
+  SessionEvent.State state = 1;
+  // This device's JIDs once paired.
+  string pn = 2;
+  string lid = 3;
+}
+
+message ReleaseSession {}
+
+// SendStanza transmits a message stanza the service built. Polymorfa checks
+// the stanza is a <message> for this session, applies the send ceiling and
+// session safety pacing, and waits for the server acknowledgement.
+message SendStanza {
+  bytes node = 1;
+  // Participant hash the stanza was built for (groups), to report a
+  // mismatch.
+  string phash = 2;
+}
+
+message SendResult {
+  int64 server_timestamp = 1;
+  // Set when the server's participant hash differs from SendStanza.phash:
+  // the device list changed and the service should refresh and resend.
+  bool participant_hash_mismatch = 2;
+}
+
+message ResolveDevices {
+  repeated string jids = 1;
+}
+
+message Devices {
+  repeated string jids = 1;
+}
+
+message FetchPreKeys {
+  repeated string jids = 1;
+}
+
+message Bundles {
+  // Device JID → bundle. Devices without a bundle are omitted.
+  map<string, Bundle> bundles = 1;
+}
+
+message Bundle {
+  uint32 registration_id = 1;
+  uint32 device_id = 2;
+  bytes identity_key = 3;
+  uint32 signed_pre_key_id = 4;
+  bytes signed_pre_key = 5;
+  bytes signed_pre_key_signature = 6;
+  // Absent when the server had no one-time prekey left.
+  PreKey pre_key = 7;
+}
+
+message ResolveGroup {
+  string jid = 1;
+}
+
+message GroupRouting {
+  repeated string participants = 1;
+  // "pn" or "lid".
+  string addressing_mode = 2;
+  // LID user → phone-number JID.
+  map<string, string> lid_to_pn = 3;
+}
+
+message Ping {}
+
+// ─── Notifications ──────────────────────────────────────────────────────
+
+message SessionEvent {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // Waiting for the QR code to be scanned.
+    STATE_PAIRING = 1;
+    STATE_CONNECTED = 2;
+    // Reconnecting to WhatsApp.
+    STATE_DISCONNECTED = 3;
+    // No Signal service holds the session; messages are held by WhatsApp.
+    STATE_PAUSED = 4;
+    // Unlinked. The service may delete the session's state.
+    STATE_LOGGED_OUT = 5;
+  }
+  string session_id = 1;
+  State state = 2;
+  string pn = 3;
+  string lid = 4;
+}
