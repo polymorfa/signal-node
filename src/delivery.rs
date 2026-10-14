@@ -16,6 +16,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
@@ -72,7 +73,8 @@ pub struct Delivery {
     webhook: Option<Webhook>,
     http: reqwest::Client,
     stream: Option<broadcast::Sender<Arc<Event>>>,
-    waiting: Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>,
+    waiting: Mutex<HashMap<String, HashMap<u64, oneshot::Sender<()>>>>,
+    next_waiter: AtomicU64,
     ack_timeout: Duration,
 }
 
@@ -88,6 +90,7 @@ impl Delivery {
             http,
             stream: sse.then(|| broadcast::channel(STREAM_BUFFER).0),
             waiting: Mutex::new(HashMap::new()),
+            next_waiter: AtomicU64::new(1),
             ack_timeout,
         }
     }
@@ -102,7 +105,7 @@ impl Delivery {
     pub async fn acknowledge(&self, event_id: &str) -> bool {
         match self.waiting.lock().await.remove(event_id) {
             Some(waiters) => {
-                for waiter in waiters {
+                for (_, waiter) in waiters {
                     let _ = waiter.send(());
                 }
                 true
@@ -122,6 +125,7 @@ impl Delivery {
             return Err(DeliveryError::NoListener);
         }
 
+        let waiter_id = self.next_waiter.fetch_add(1, Ordering::Relaxed);
         let acked = if listeners > 0 {
             let (tx, rx) = oneshot::channel();
             self.waiting
@@ -129,7 +133,7 @@ impl Delivery {
                 .await
                 .entry(event.id.clone())
                 .or_default()
-                .push(tx);
+                .insert(waiter_id, tx);
             if let Some(stream) = &self.stream {
                 let _ = stream.send(event.clone());
             }
@@ -161,7 +165,13 @@ impl Delivery {
         .await
         .unwrap_or(Err(DeliveryError::NotAcknowledged));
 
-        self.waiting.lock().await.remove(&event.id);
+        let mut waiting = self.waiting.lock().await;
+        if let Some(waiters) = waiting.get_mut(&event.id) {
+            waiters.remove(&waiter_id);
+            if waiters.is_empty() {
+                waiting.remove(&event.id);
+            }
+        }
         result
     }
 

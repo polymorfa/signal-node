@@ -266,7 +266,7 @@ fn default_prune_minutes() -> u64 {
 }
 
 /// Settings resolved from the file, environment and secret files.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Resolved {
     pub node_id: String,
     pub polymorfa_url: String,
@@ -291,6 +291,20 @@ pub struct Resolved {
     pub decrypt_buffer_retention: Duration,
     pub sent_message_retention: Duration,
     pub prune_interval: Duration,
+}
+
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolved")
+            .field("node_id", &self.node_id)
+            .field("sessions", &self.sessions)
+            .field("storage_driver", &self.storage_driver)
+            .field("master_key", &"<redacted>")
+            .field("credential", &self.credential)
+            .field("http_secret", &self.http_secret)
+            .field("webhook_secret", &self.webhook_secret)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The environment variables read on top of the file.
@@ -385,9 +399,43 @@ impl Config {
         if credential.is_empty() {
             return Err(invalid("polymorfa.credential is required"));
         }
-        if !(self.polymorfa.url.starts_with("ws://") || self.polymorfa.url.starts_with("wss://"))
+        let relay = reqwest::Url::parse(&self.polymorfa.url)
+            .map_err(|_| invalid("polymorfa.url is invalid"))?;
+        let local = matches!(relay.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        if !(relay.scheme() == "wss" || relay.scheme() == "ws" && local)
+            || !relay.username().is_empty()
+            || relay.password().is_some()
+            || relay.query().is_some()
+            || relay.fragment().is_some()
         {
-            return Err(invalid("polymorfa.url must be a ws:// or wss:// URL"));
+            return Err(invalid(
+                "polymorfa.url requires wss (ws only on loopback) without credentials, query or fragment",
+            ));
+        }
+        if let Some(target) = &self.delivery.webhook_url {
+            let url = reqwest::Url::parse(target)
+                .map_err(|_| invalid("delivery.webhook_url is invalid"))?;
+            let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+            if !(url.scheme() == "https" || url.scheme() == "http" && local)
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(invalid(
+                    "delivery.webhook_url requires HTTPS (HTTP only on loopback) without URL credentials or fragment",
+                ));
+            }
+        }
+        if self.polymorfa.request_timeout_ms == 0
+            || self.polymorfa.reconnect_min_ms == 0
+            || self.polymorfa.reconnect_max_ms < self.polymorfa.reconnect_min_ms
+            || self.leases.ttl_ms == 0
+            || self.leases.renew_interval_ms == 0
+            || self.delivery.ack_timeout_ms == 0
+        {
+            return Err(invalid(
+                "timeouts and lease intervals must be positive and reconnect bounds ordered",
+            ));
         }
         let storage_url = secret_or_file(
             self.storage.url,
@@ -471,11 +519,7 @@ impl Config {
     }
 }
 
-fn secret_or_file(
-    inline: Secret,
-    file: Option<&Path>,
-    name: &str,
-) -> Result<Secret, ConfigError> {
+fn secret_or_file(inline: Secret, file: Option<&Path>, name: &str) -> Result<Secret, ConfigError> {
     match (inline.is_empty(), file) {
         (false, Some(_)) => Err(invalid(format!("set {name} or {name}_file, not both"))),
         (true, Some(path)) => {
@@ -565,10 +609,7 @@ mod tests {
 
     #[test]
     fn bad_values_are_refused() {
-        let short_key = MINIMAL.replace(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            "AAAA",
-        );
+        let short_key = MINIMAL.replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AAAA");
         assert!(Config::from_toml(&short_key).unwrap().resolve().is_err());
         let http_url = MINIMAL.replace("wss://", "https://");
         assert!(Config::from_toml(&http_url).unwrap().resolve().is_err());

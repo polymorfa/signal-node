@@ -84,7 +84,7 @@ impl Link {
     pub fn max_sends_per_second(&self) -> u32 {
         match self.welcome.max_sends_per_second {
             0 => DEFAULT_MAX_SENDS_PER_SECOND,
-            n => n,
+            n => n.min(DEFAULT_MAX_SENDS_PER_SECOND),
         }
     }
 
@@ -151,7 +151,8 @@ impl Link {
 /// What the node does with traffic from Polymorfa.
 #[async_trait]
 pub trait Handler: Send + Sync + 'static {
-    async fn runner_request(&self, request: RunnerRequest) -> Result<ServiceResponse, proto::Error>;
+    async fn runner_request(&self, request: RunnerRequest)
+    -> Result<ServiceResponse, proto::Error>;
     async fn session_event(&self, event: SessionEvent);
     /// A link finished its handshake. Claims go out from here.
     async fn connected(&self, link: Arc<Link>);
@@ -394,7 +395,10 @@ async fn dispatch(link: &Arc<Link>, handler: &Arc<dyn Handler>, frame: Frame) {
         },
         Some(Body::Error(error)) => {
             if id == 0 {
-                tracing::warn!(code = error.code_enum().as_str_name(), "Polymorfa reported an error");
+                tracing::warn!(
+                    code = error.code_enum().as_str_name(),
+                    "Polymorfa reported an error"
+                );
             } else {
                 link.complete(id, Err(error)).await;
             }
@@ -419,10 +423,7 @@ async fn dispatch(link: &Arc<Link>, handler: &Arc<dyn Handler>, frame: Frame) {
             if id != 0 {
                 link.reply(Frame::with(
                     id,
-                    Body::Error(proto::Error::new(
-                        Code::Unsupported,
-                        "unknown frame type",
-                    )),
+                    Body::Error(proto::Error::new(Code::Unsupported, "unknown frame type")),
                 ));
             }
         }

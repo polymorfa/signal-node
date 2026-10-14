@@ -45,6 +45,13 @@ pub fn router(node: Arc<Node>) -> Router {
 }
 
 async fn authenticate(State(node): State<Arc<Node>>, request: Request, next: Next) -> Response {
+    if request.headers().contains_key(header::ORIGIN) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "origin_forbidden",
+            "the application API accepts server clients only",
+        );
+    }
     let presented = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -55,18 +62,17 @@ async fn authenticate(State(node): State<Arc<Node>>, request: Request, next: Nex
     if bool::from(presented.as_bytes().ct_eq(expected)) {
         next.run(request).await
     } else {
-        error(StatusCode::UNAUTHORIZED, "unauthorized", "missing or wrong bearer secret")
+        error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or wrong bearer secret",
+        )
     }
 }
 
 async fn health(State(node): State<Arc<Node>>) -> Response {
-    Json(json!({
-        "status": "ok",
-        "node_id": node.cfg.node_id,
-        "connected": node.link().is_some(),
-        "sessions_held": node.sessions().len(),
-    }))
-    .into_response()
+    let _ = node;
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 #[derive(Serialize)]
@@ -104,7 +110,11 @@ async fn send_message(
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request", e.body_text()),
     };
     if !node.is_configured(&id) {
-        return error(StatusCode::NOT_FOUND, "unknown_session", "session is not configured");
+        return error(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "session is not configured",
+        );
     }
     let Some(session) = node.session(&id) else {
         return error(
@@ -159,7 +169,11 @@ async fn events(
         // A lagging client misses events; they are not acknowledged, so the
         // receive fails and the message is redelivered later.
         let event = item.ok()?;
-        if filter.session_id.as_ref().is_some_and(|s| *s != event.session_id) {
+        if filter
+            .session_id
+            .as_ref()
+            .is_some_and(|s| *s != event.session_id)
+        {
             return None;
         }
         let data = serde_json::to_string(&*event).ok()?;
