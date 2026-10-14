@@ -11,7 +11,15 @@ const USAGE: &str = "usage: signal-node [--config <file>] | signal-node generate
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("generate-key") {
+    if args.as_slice() == ["--version"] {
+        println!("{}", signal_node::SERVICE_VERSION);
+        return Ok(());
+    }
+    if args.as_slice() == ["--help"] {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.as_slice() == ["generate-key"] {
         // For the operator to store as storage.master_key; printed once.
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
@@ -30,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_env("SIGNAL_NODE_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     if json {
-        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }

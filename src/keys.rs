@@ -177,7 +177,11 @@ mod tests {
             "the data key was stored unwrapped"
         );
         // A later holder of the scope opens the same key.
-        let next = records.acquire("s", "b", 20_000, 10_000).await.unwrap().unwrap();
+        let next = records
+            .acquire("s", "b", 20_000, 10_000)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             master.data_key_for(&records, &next.fence).await.unwrap(),
             first

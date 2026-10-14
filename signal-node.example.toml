@@ -1,0 +1,42 @@
+# Operator example. Replace the URL and session IDs with eligible real values.
+node_id = "customer-node-1"
+
+[polymorfa]
+url = "wss://api.example.invalid/api/zk/signal"
+credential_file = "/run/secrets/polymorfa-project-credential"
+sessions = ["replace-with-session-id"]
+request_timeout_ms = 15000
+reconnect_min_ms = 500
+reconnect_max_ms = 30000
+
+[storage]
+driver = "sqlite"
+url = "sqlite:///var/lib/signal-node/state.sqlite"
+master_key_file = "/run/secrets/signal-master-key"
+max_connections = 10
+# Multi-host deployments instead use driver = "postgres" and url_file.
+# Keep the master key outside the database and consistent across replicas.
+
+[leases]
+ttl_ms = 30000
+renew_interval_ms = 10000
+
+[http]
+listen = "0.0.0.0:8787"
+secret_file = "/run/secrets/signal-application-secret"
+
+[delivery]
+sse = true
+ack_timeout_ms = 10000
+# Optional alternative/additional channel; return 2xx only after durable commit.
+# webhook_url = "https://customer.example.invalid/signal-events"
+# webhook_secret_file = "/run/secrets/signal-webhook-secret"
+
+[history]
+# Explicit operator consent. This never grants backend session eligibility.
+deliver = false
+
+[retention]
+decrypt_buffer_hours = 336
+sent_message_hours = 168
+prune_interval_minutes = 60

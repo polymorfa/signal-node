@@ -18,10 +18,16 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("parsing the config file: {0}")]
-    Parse(#[from] toml::de::Error),
+    #[error("config file is not valid TOML; check field names and value types")]
+    Parse,
     #[error("{0}")]
     Invalid(String),
+}
+
+impl From<toml::de::Error> for ConfigError {
+    fn from(_: toml::de::Error) -> Self {
+        Self::Parse
+    }
 }
 
 fn invalid(message: impl Into<String>) -> ConfigError {
@@ -474,7 +480,7 @@ impl Config {
                 "set delivery.webhook_url or enable delivery.sse; messages need somewhere to go",
             ));
         }
-        if self.leases.renew_interval_ms * 2 > self.leases.ttl_ms {
+        if self.leases.renew_interval_ms > self.leases.ttl_ms / 2 {
             return Err(invalid(
                 "leases.renew_interval_ms must be at most half of leases.ttl_ms",
             ));
@@ -489,6 +495,22 @@ impl Config {
         } else {
             self.node_id
         };
+        let buffer_seconds = self
+            .retention
+            .decrypt_buffer_hours
+            .checked_mul(3600)
+            .ok_or_else(|| invalid("decrypt buffer retention is too large"))?;
+        let sent_seconds = self
+            .retention
+            .sent_message_hours
+            .checked_mul(3600)
+            .ok_or_else(|| invalid("sent message retention is too large"))?;
+        let prune_seconds = self
+            .retention
+            .prune_interval_minutes
+            .max(1)
+            .checked_mul(60)
+            .ok_or_else(|| invalid("prune interval is too large"))?;
         Ok(Resolved {
             node_id,
             polymorfa_url: self.polymorfa.url,
@@ -510,11 +532,9 @@ impl Config {
             sse: self.delivery.sse,
             ack_timeout: Duration::from_millis(self.delivery.ack_timeout_ms),
             deliver_history: self.history.deliver,
-            decrypt_buffer_retention: Duration::from_secs(
-                self.retention.decrypt_buffer_hours * 3600,
-            ),
-            sent_message_retention: Duration::from_secs(self.retention.sent_message_hours * 3600),
-            prune_interval: Duration::from_secs(self.retention.prune_interval_minutes.max(1) * 60),
+            decrypt_buffer_retention: Duration::from_secs(buffer_seconds),
+            sent_message_retention: Duration::from_secs(sent_seconds),
+            prune_interval: Duration::from_secs(prune_seconds),
         })
     }
 }
@@ -618,5 +638,27 @@ mod tests {
         let mut no_sink = Config::from_toml(MINIMAL).unwrap();
         no_sink.delivery.sse = false;
         assert!(no_sink.resolve().is_err());
+    }
+    #[test]
+    fn configuration_refuses_unsafe_urls_and_overflows_without_echoing_secrets() {
+        for url in [
+            "ws://example.invalid/signal",
+            "wss://secret@example.invalid/signal",
+            "wss://example.invalid/signal?token=secret",
+            "wss://example.invalid/signal#secret",
+        ] {
+            let mut config = Config::from_toml(MINIMAL).unwrap();
+            config.polymorfa.url = url.into();
+            let error = config.resolve().unwrap_err().to_string();
+            assert!(!error.contains("secret"));
+        }
+        let error = Config::from_toml("http = secret-material-not-toml").unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("secret-material"));
+        let mut config = Config::from_toml(MINIMAL).unwrap();
+        config.retention.decrypt_buffer_hours = u64::MAX;
+        assert!(config.resolve().is_err());
+        let mut config = Config::from_toml(MINIMAL).unwrap();
+        config.leases.renew_interval_ms = u64::MAX;
+        assert!(config.resolve().is_err());
     }
 }

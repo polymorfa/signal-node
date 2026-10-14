@@ -42,7 +42,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "migrate", "macros"] }
 subtle = "2.6"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 toml = "0.9"
@@ -54,5 +54,8 @@ prost-build = "0.14"
 protox = "0.9"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229", features = ["test-util"] }
+rand10 = { package = "rand", version = "0.10" }
 wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229", features = ["conformance"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

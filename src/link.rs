@@ -334,6 +334,16 @@ async fn connect_and_serve(
         })
     };
 
+    // Abort spawned socket tasks even if the enclosing future is cancelled
+    // during a crash, shutdown select, or handshake callback.
+    struct SocketTasks(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>);
+    impl Drop for SocketTasks {
+        fn drop(&mut self) {
+            self.0.abort();
+            self.1.abort();
+        }
+    }
+    let _socket_tasks = SocketTasks(writer, pinger);
     handler.connected(link.clone()).await;
 
     let result = loop {
@@ -360,8 +370,6 @@ async fn connect_and_serve(
 
     link.close();
     link.fail_all().await;
-    pinger.abort();
-    writer.abort();
     handler.disconnected().await;
     result
 }

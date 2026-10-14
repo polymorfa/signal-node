@@ -250,11 +250,7 @@ pub enum BuildError {
     UnknownKind(String),
 }
 
-fn decode_field(
-    value: &str,
-    field: &'static str,
-    len: usize,
-) -> Result<Vec<u8>, BuildError> {
+fn decode_field(value: &str, field: &'static str, len: usize) -> Result<Vec<u8>, BuildError> {
     if value.is_empty() {
         return Err(BuildError::Missing(field));
     }
@@ -463,7 +459,10 @@ mod tests {
         };
         assert!(matches!(
             build_message(&request, 0),
-            Err(BuildError::BadLength { field: "media_key", .. })
+            Err(BuildError::BadLength {
+                field: "media_key",
+                ..
+            })
         ));
         let mut odd = image();
         odd.kind = "hologram".into();

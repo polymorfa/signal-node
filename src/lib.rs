@@ -43,10 +43,23 @@ pub struct Running {
 
 impl Running {
     /// Release every session, then stop.
-    pub async fn shutdown(self) {
-        self.node.shutdown().await;
-        for task in self.tasks {
-            let _ = task.await;
+    pub async fn shutdown(mut self) {
+        // Open SSE streams or a stalled peer cannot hold shutdown forever.
+        // Aborting after this deadline leaves any unreleased lease to expire.
+        let cleanup = async {
+            self.node.shutdown().await;
+            for task in &mut self.tasks {
+                let _ = task.await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+            .await
+            .is_err()
+        {
+            for task in &self.tasks {
+                task.abort();
+            }
+            tracing::warn!("shutdown deadline reached; remaining leases will expire");
         }
     }
 

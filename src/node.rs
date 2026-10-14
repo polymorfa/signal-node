@@ -103,6 +103,11 @@ impl ActiveSession {
         self.lost.load(Ordering::SeqCst)
     }
 
+    /// Fail closed when a paused process resumes beyond its lease deadline.
+    pub async fn can_serve(&self) -> bool {
+        !self.is_lost() && now_ms() < self.lease.lock().await.expires_at_ms
+    }
+
     pub fn view(&self) -> SessionView {
         self.view.read().expect("view lock").clone()
     }
@@ -161,7 +166,11 @@ impl Node {
     }
 
     pub fn session(&self, id: &str) -> Option<Arc<ActiveSession>> {
-        self.sessions.read().expect("sessions lock").get(id).cloned()
+        self.sessions
+            .read()
+            .expect("sessions lock")
+            .get(id)
+            .cloned()
     }
 
     pub fn sessions(&self) -> Vec<Arc<ActiveSession>> {
@@ -194,11 +203,22 @@ impl Node {
 
     /// Stop serving `id` because another node owns it now. The lease is not
     /// released: it is no longer ours.
-    pub fn lose(&self, id: &str, why: &str) {
-        let removed = self.sessions.write().expect("sessions lock").remove(id);
+    pub fn lose(&self, id: &str, generation: u64, why: &str) {
+        let removed = {
+            let mut sessions = self.sessions.write().expect("sessions lock");
+            if sessions.get(id).is_none_or(|s| s.generation != generation) {
+                return;
+            }
+            sessions.remove(id)
+        };
         if let Some(session) = removed {
             session.lost.store(true, Ordering::SeqCst);
-            tracing::warn!(session = id, generation = session.generation, reason = why, "stopped serving session");
+            tracing::warn!(
+                session = id,
+                generation = session.generation,
+                reason = why,
+                "stopped serving session"
+            );
         }
     }
 
@@ -220,15 +240,26 @@ impl Node {
         if let Err(e) = self.backend.release(&lease).await {
             tracing::warn!(session = id, error = %e, "could not release the lease; it will expire");
         }
-        tracing::info!(session = id, generation = session.generation, "released session");
+        tracing::info!(
+            session = id,
+            generation = session.generation,
+            "released session"
+        );
     }
 
     /// Map an operation error to a contract error, dropping the session if
     /// the store says another node took it.
     pub fn ops_error(&self, session: &ActiveSession, error: &OpsError) -> proto::Error {
         if error.is_fence_lost() {
-            self.lose(&session.id, "store refused a write: lease moved to another node");
-            return proto::Error::new(Code::NotLeaseHolder, "this node no longer holds the session");
+            self.lose(
+                &session.id,
+                session.generation,
+                "store refused a write: lease moved to another node",
+            );
+            return proto::Error::new(
+                Code::NotLeaseHolder,
+                "this node no longer holds the session",
+            );
         }
         match error {
             OpsError::Store(_) => proto::Error::new(Code::Unavailable, "storage is unavailable"),
@@ -239,9 +270,10 @@ impl Node {
                 Code::SessionUnavailable,
                 "device keys do not exist yet; GetIdentity creates them",
             ),
-            OpsError::Pairing { code, text } => {
-                proto::Error::new(Code::InvalidArgument, format!("pairing refused: {code} {text}"))
-            }
+            OpsError::Pairing { code, text } => proto::Error::new(
+                Code::InvalidArgument,
+                format!("pairing refused: {code} {text}"),
+            ),
             OpsError::Send(_) => proto::Error::new(Code::Unavailable, "building the stanza failed"),
             OpsError::Signal(_) => proto::Error::new(Code::Internal, "signal protocol error"),
         }
@@ -289,6 +321,9 @@ impl Node {
     pub async fn tick_leases(self: &Arc<Self>) {
         let ttl = self.cfg.lease_ttl_ms;
         for id in &self.cfg.sessions {
+            if *self.shutdown.borrow() {
+                return;
+            }
             if self.retired.read().expect("retired lock").contains(id) {
                 continue;
             }
@@ -296,18 +331,29 @@ impl Node {
                 Some(session) => {
                     let lease = session.lease().await;
                     let now = now_ms();
+                    if now >= lease.expires_at_ms {
+                        self.lose(id, session.generation, "lease expired before renewal");
+                        // Releasing our still-current expired lease ensures a subsequent
+                        // reacquisition increments the generation, even with this holder ID.
+                        let _ = self.backend.release(&lease).await;
+                        continue;
+                    }
                     match self.backend.renew(&lease, now, ttl).await {
                         Ok(Some(renewed)) => *session.lease.lock().await = renewed,
                         Ok(None) => {
-                            self.lose(id, "lease taken over");
+                            self.lose(id, session.generation, "lease taken over");
                             continue;
                         }
                         Err(e) => {
                             tracing::warn!(session = %id, error = %e, "lease renewal failed");
                             // Stop before another node can take it.
                             let margin = self.cfg.lease_renew.as_millis() as u64;
-                            if now + margin >= lease.expires_at_ms {
-                                self.lose(id, "lease could not be renewed before it expired");
+                            if now.saturating_add(margin) >= lease.expires_at_ms {
+                                self.lose(
+                                    id,
+                                    session.generation,
+                                    "lease could not be renewed before it expired",
+                                );
                                 continue;
                             }
                         }
@@ -326,6 +372,10 @@ impl Node {
                             let generation = lease.fence.generation;
                             match self.activate(lease.clone()).await {
                                 Ok(session) => {
+                                    if *self.shutdown.borrow() {
+                                        let _ = self.backend.release(&lease).await;
+                                        continue;
+                                    }
                                     tracing::info!(session = %id, generation, "took session lease");
                                     self.sessions
                                         .write()
@@ -349,7 +399,9 @@ impl Node {
 
     fn spawn_claim(&self, session: Arc<ActiveSession>) {
         let Some(link) = self.link() else { return };
-        let Some(node) = self.me.upgrade() else { return };
+        let Some(node) = self.me.upgrade() else {
+            return;
+        };
         if session.claiming.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -360,11 +412,17 @@ impl Node {
     }
 
     async fn claim(&self, session: &Arc<ActiveSession>, link: &Arc<Link>) {
+        if !session.can_serve().await {
+            return;
+        }
         let op = service_request::Op::ClaimSession(ClaimSession {
             generation: session.generation,
         });
         match link.request(&session.id, 0, op).await {
             Ok(runner_response::Result::SessionClaimed(claimed)) => {
+                if !session.can_serve().await {
+                    return;
+                }
                 session.claimed.store(true, Ordering::SeqCst);
                 session.set_view(claimed.state, &claimed.pn, &claimed.lid);
                 tracing::info!(
@@ -390,7 +448,11 @@ impl Node {
             Ok(_) => tracing::warn!(session = %session.id, "unexpected answer to ClaimSession"),
             Err(LinkError::Remote(error)) => match error.code_enum() {
                 Code::NotLeaseHolder => {
-                    self.lose(&session.id, "Polymorfa accepted a newer claim");
+                    self.lose(
+                        &session.id,
+                        session.generation,
+                        "Polymorfa accepted a newer claim",
+                    );
                 }
                 Code::SessionUnavailable => tracing::warn!(
                     session = %session.id,
@@ -416,9 +478,13 @@ impl Node {
 
     async fn prune(self: &Arc<Self>) {
         let now = now_ms();
-        let buffer_cutoff = now.saturating_sub(self.cfg.decrypt_buffer_retention.as_millis() as u64);
+        let buffer_cutoff =
+            now.saturating_sub(self.cfg.decrypt_buffer_retention.as_millis() as u64);
         let sent_cutoff = now.saturating_sub(self.cfg.sent_message_retention.as_millis() as u64);
         for session in self.sessions() {
+            if !session.can_serve().await {
+                continue;
+            }
             let Some(ops) = session.ops() else { continue };
             let result = async {
                 let buffered = ops.prune_decrypt_buffer(buffer_cutoff).await?;
@@ -487,24 +553,29 @@ impl Node {
 
     /// Release every session, then stop the loops.
     pub async fn shutdown(&self) {
+        // Prevent renewal/reacquisition while releasing sessions. Socket closure
+        // removes routing claims even if ReleaseSession races the stop signal.
+        let _ = self.shutdown.send(true);
         let ids: Vec<String> = self.sessions().iter().map(|s| s.id.clone()).collect();
         for id in ids {
             self.release(&id).await;
         }
-        let _ = self.shutdown.send(true);
     }
 }
 
 #[async_trait]
 impl Handler for Node {
-    async fn runner_request(&self, request: RunnerRequest) -> Result<ServiceResponse, proto::Error> {
+    async fn runner_request(
+        &self,
+        request: RunnerRequest,
+    ) -> Result<ServiceResponse, proto::Error> {
         let Some(session) = self.session(&request.session_id) else {
             return Err(proto::Error::new(
                 Code::NotLeaseHolder,
                 "this node does not hold the session",
             ));
         };
-        if request.lease_generation != session.generation {
+        if request.lease_generation != session.generation || !session.can_serve().await {
             return Err(proto::Error::new(
                 Code::NotLeaseHolder,
                 format!(

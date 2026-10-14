@@ -37,7 +37,10 @@ impl SendLimiter {
         let mut sent = self.sent.lock().await;
         loop {
             let now = Instant::now();
-            while sent.front().is_some_and(|t| now.duration_since(*t) >= WINDOW) {
+            while sent
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= WINDOW)
+            {
                 sent.pop_front();
             }
             if sent.len() < limit {

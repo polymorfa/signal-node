@@ -21,7 +21,9 @@ use wacore::types::jid::JidExt as _;
 use wacore::types::message::AddressingMode;
 use wacore_binary::Jid;
 use wacore_recordstore::{Namespace, RecordStore, Sealer};
-use wacore_signal_ops::{OpsError, ReceiveKind, ReceiveRequest, Received, RetryRequest, RetryRoute};
+use wacore_signal_ops::{
+    OpsError, ReceiveKind, ReceiveRequest, Received, RetryRequest, RetryRoute,
+};
 
 fn respond(result: Out) -> Result<ServiceResponse, proto::Error> {
     Ok(ServiceResponse {
@@ -82,7 +84,9 @@ pub async fn handle(
             }))
         }
         Op::MarkPreKeysUploaded(request) => {
-            ops.mark_prekeys_uploaded(&request.ids).await.map_err(fail)?;
+            ops.mark_prekeys_uploaded(&request.ids)
+                .await
+                .map_err(fail)?;
             respond(Out::Ok(proto::Ok {}))
         }
         Op::UploadedPreKeyCount(_) => {
@@ -189,9 +193,15 @@ pub fn receive_error(node: &Node, session: &ActiveSession, error: &OpsError) -> 
         }
         OpsError::Signal(
             SignalProtocolError::NoSenderKeyState(_) | SignalProtocolError::InvalidSenderKeySession,
-        ) => proto::Error::decrypt_failed(DecryptFailure::NoSenderKey, "no sender key for this sender"),
+        ) => proto::Error::decrypt_failed(
+            DecryptFailure::NoSenderKey,
+            "no sender key for this sender",
+        ),
         OpsError::InvalidInput(message) if message.starts_with("plaintext did not decode") => {
-            proto::Error::decrypt_failed(DecryptFailure::Undecodable, "decrypted payload is not a message")
+            proto::Error::decrypt_failed(
+                DecryptFailure::Undecodable,
+                "decrypted payload is not a message",
+            )
         }
         OpsError::NotInitialised => node.ops_error(session, error),
         _ => proto::Error::decrypt_failed(DecryptFailure::Unspecified, "decryption failed"),
@@ -212,8 +222,8 @@ async fn receive(
         "skmsg" => ReceiveKind::SenderKey,
         _ => return Err(invalid("kind must be pkmsg, msg or skmsg")),
     };
-    let padding_version =
-        u8::try_from(receive.padding_version).map_err(|_| invalid("padding_version out of range"))?;
+    let padding_version = u8::try_from(receive.padding_version)
+        .map_err(|_| invalid("padding_version out of range"))?;
     let received = ops
         .receive(ReceiveRequest {
             chat: &receive.chat,
@@ -263,6 +273,12 @@ async fn receive(
         }
         tracing::debug!(session = %session.id, message_id = %receive.message_id, kind, "delivered");
     }
+    if !session.can_serve().await {
+        return Err(proto::Error::new(
+            Code::NotLeaseHolder,
+            "the lease expired before delivery was recorded",
+        ));
+    }
     ops.mark_delivered(&message.receipt_key)
         .await
         .map_err(|e| node.ops_error(session, &e))?;
@@ -304,6 +320,19 @@ fn event_for(
         history: None,
         message_proto: String::new(),
     };
+    // Requests are content-level protocol traffic, not customer messages.
+    // Cellar 1049950004 WAWebHandleMsgProcess.js:218-228 dispatches these separately.
+    if content
+        .message
+        .protocol_message
+        .as_option()
+        .is_some_and(|protocol| {
+            protocol.app_state_sync_key_request.is_set()
+                || protocol.peer_data_operation_request_message.is_set()
+        })
+    {
+        return None;
+    }
     if let Some(protocol) = &content.protocol_message {
         if let Some(history) = &protocol.history_sync_notification {
             // History comes only from this account's own devices.

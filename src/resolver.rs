@@ -78,7 +78,10 @@ pub fn remote_bundle(bundle: &proto::Bundle) -> anyhow::Result<RemoteBundle> {
         identity_key: array(&bundle.identity_key, "identity_key")?,
         signed_prekey_id: bundle.signed_pre_key_id,
         signed_prekey: array(&bundle.signed_pre_key, "signed_pre_key")?,
-        signed_prekey_signature: array(&bundle.signed_pre_key_signature, "signed_pre_key_signature")?,
+        signed_prekey_signature: array(
+            &bundle.signed_pre_key_signature,
+            "signed_pre_key_signature",
+        )?,
         prekey: match &bundle.pre_key {
             Some(pk) => Some((pk.id, array(&pk.public_key, "pre_key.public_key")?)),
             None => None,

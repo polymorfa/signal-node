@@ -9,9 +9,7 @@
 //! serialised: the write either commits before the generation moves or sees
 //! the new generation and applies nothing.
 
-use super::{
-    LeaseDecision, db_error, decide, empty_holder, prefix_end, to_i64, to_u64,
-};
+use super::{LeaseDecision, db_error, decide, empty_holder, prefix_end, to_i64, to_u64};
 use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Postgres, Row, Transaction};

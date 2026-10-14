@@ -64,6 +64,19 @@ pub fn verify(secret: &[u8], timestamp: i64, body: &[u8], signature: &str) -> bo
     mac.verify_slice(&expected).is_ok()
 }
 
+/// Verify both the MAC and the timestamp window before processing an event.
+/// This does not replace durable deduplication by the event ID.
+pub fn verify_recent(
+    secret: &[u8],
+    timestamp: i64,
+    body: &[u8],
+    signature: &str,
+    now: i64,
+    max_age: Duration,
+) -> bool {
+    timestamp.abs_diff(now) <= max_age.as_secs() && verify(secret, timestamp, body, signature)
+}
+
 pub struct Webhook {
     pub url: String,
     pub secret: crate::config::Secret,
@@ -237,6 +250,30 @@ mod tests {
         assert!(!verify(b"other", 100, b"{}", &sig));
         assert!(!verify(b"secret", 100, b"{ }", &sig));
         assert!(!verify(b"secret", 100, b"{}", "garbage"));
+        assert!(verify_recent(
+            b"secret",
+            100,
+            b"{}",
+            &sig,
+            105,
+            Duration::from_secs(5)
+        ));
+        assert!(!verify_recent(
+            b"secret",
+            100,
+            b"{}",
+            &sig,
+            106,
+            Duration::from_secs(5)
+        ));
+        assert!(!verify_recent(
+            b"secret",
+            100,
+            b"{}",
+            &sig,
+            94,
+            Duration::from_secs(5)
+        ));
     }
 
     #[tokio::test]
@@ -272,5 +309,25 @@ mod tests {
             delivery.deliver(event("c")).await,
             Err(DeliveryError::NotAcknowledged)
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn one_duplicate_timeout_does_not_remove_another_waiter() {
+        let delivery = Arc::new(Delivery::new(None, true, Duration::from_millis(250)));
+        let mut rx = delivery.subscribe().unwrap();
+        let first = {
+            let d = delivery.clone();
+            tokio::spawn(async move { d.deliver(event("same")).await })
+        };
+        rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let second = {
+            let d = delivery.clone();
+            tokio::spawn(async move { d.deliver(event("same")).await })
+        };
+        rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(151)).await;
+        assert_eq!(first.await.unwrap(), Err(DeliveryError::NotAcknowledged));
+        assert!(delivery.acknowledge("same").await);
+        assert_eq!(second.await.unwrap(), Ok(()));
     }
 }

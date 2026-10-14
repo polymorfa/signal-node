@@ -11,12 +11,11 @@
 //! When the server reports a participant-hash mismatch, the device list
 //! changed while the message was in flight. WhatsApp Web then refreshes the
 //! device list or group and resends the same message ID
-//! (`WAWebSendUserMsgJob.js:53-75`, `WAWebSendGroupSkmsgJob.js:196-215`,
-//! `WAWebResendGroupMsg.js:28-110`, Cellar bundle `whatsapp-1049257521`). The
-//! node does the same once: it rebuilds with fresh lookups and the same ID.
-//! WhatsApp Web resends only to devices it had not addressed; the node
-//! re-encrypts for every current device, and recipients drop the duplicate
-//! by message ID.
+//! (`WAWebSendUserMsgJob.js:53-79`, `WAWebSendGroupSkmsgJob.js:194-213`,
+//! Cellar bundle `whatsapp-1049950004`). The node rebuilds once with fresh
+//! lookups and the same ID. WA Web excludes previously addressed devices;
+//! this implementation re-encrypts for every current device. Provider
+//! acceptance of that broader resend remains an integration gate.
 
 use crate::link::LinkError;
 use crate::message::{self, BuildError, SendRequest};
@@ -98,17 +97,14 @@ pub async fn send(
     let now = crate::delivery::now_secs();
     let message = message::build_message(&request, now)?;
     let ops = session.ops().ok_or(SendError::NotPaired)?;
-    let own = session
-        .view()
-        .pn
-        .and_then(|pn| pn.parse::<Jid>().ok());
+    let own = session.view().pn.and_then(|pn| pn.parse::<Jid>().ok());
     let message_id =
         wacore::request::RequestUtils::message_id_at(own.as_ref(), u64::try_from(now).unwrap_or(0));
 
     let mut resent = false;
     loop {
         let link = node.link().ok_or(SendError::Disconnected)?;
-        if session.is_lost() {
+        if !session.can_serve().await || !session.is_claimed() {
             return Err(SendError::NotLeaseHolder);
         }
         let resolver = RemoteResolver {
@@ -143,21 +139,30 @@ pub async fn send(
         };
 
         session.limiter.acquire(link.max_sends_per_second()).await;
+        if !session.can_serve().await || !session.is_claimed() {
+            return Err(SendError::NotLeaseHolder);
+        }
         let op = service_request::Op::SendStanza(SendStanza {
             node: stanza,
             phash,
         });
         let result = match link.request(&session.id, session.generation, op).await {
             Ok(runner_response::Result::Send(result)) => result,
-            Ok(_) => return Err(SendError::Refused(proto::Error::new(
-                Code::Internal,
-                "unexpected answer to SendStanza",
-            ))),
+            Ok(_) => {
+                return Err(SendError::Refused(proto::Error::new(
+                    Code::Internal,
+                    "unexpected answer to SendStanza",
+                )));
+            }
             Err(LinkError::Remote(error)) => {
                 return Err(match error.code_enum() {
                     Code::RateLimited => SendError::RateLimited,
                     Code::NotLeaseHolder => {
-                        node.lose(&session.id, "Polymorfa refused a send at this generation");
+                        node.lose(
+                            &session.id,
+                            session.generation,
+                            "Polymorfa refused a send at this generation",
+                        );
                         SendError::NotLeaseHolder
                     }
                     _ => SendError::Refused(error),
@@ -167,7 +172,7 @@ pub async fn send(
         };
 
         // WA Web marks the sender key as held once the server acks, before
-        // it looks at the participant hash (WAWebSendGroupSkmsgJob.js:197).
+        // it looks at the participant hash (WAWebSendGroupSkmsgJob.js:199).
         if let Built::Group { targets, .. } = &built
             && !targets.is_empty()
             && let Err(e) = ops.mark_sender_key_distributed(&to, targets).await

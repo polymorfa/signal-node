@@ -18,7 +18,9 @@ pub use sqlite::SqliteStore;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::store::error::{Result, StoreError};
-use wacore_recordstore::{Fence, Lease, LeaseStore, MemoryRecordStore, Namespace, RecordStore, WriteOp};
+use wacore_recordstore::{
+    Fence, Lease, LeaseStore, MemoryRecordStore, Namespace, RecordStore, WriteOp,
+};
 
 use crate::config::{Resolved, StorageDriver};
 
@@ -36,8 +38,7 @@ impl Backend {
         Ok(match config.storage_driver {
             StorageDriver::Memory => Backend::Memory(Arc::new(MemoryRecordStore::new())),
             StorageDriver::Postgres => Backend::Postgres(
-                PostgresStore::connect(config.storage_url.expose(), config.max_connections)
-                    .await?,
+                PostgresStore::connect(config.storage_url.expose(), config.max_connections).await?,
             ),
             StorageDriver::Sqlite => Backend::Sqlite(
                 SqliteStore::connect(config.storage_url.expose(), config.max_connections).await?,
@@ -166,11 +167,7 @@ pub(crate) enum LeaseDecision {
     Take { generation: u64 },
 }
 
-pub(crate) fn decide(
-    row: Option<(&str, u64, u64)>,
-    holder: &str,
-    now_ms: u64,
-) -> LeaseDecision {
+pub(crate) fn decide(row: Option<(&str, u64, u64)>, holder: &str, now_ms: u64) -> LeaseDecision {
     match row {
         None => LeaseDecision::Take { generation: 1 },
         Some((current, generation, _)) if current == holder => LeaseDecision::Take { generation },
