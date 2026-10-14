@@ -133,6 +133,8 @@ pub struct Node {
     pub cfg: Arc<Resolved>,
     backend: Arc<Backend>,
     master: MasterKey,
+    /// Unique process incarnation; stable diagnostic node IDs cannot share a fence.
+    lease_holder: String,
     sessions: RwLock<HashMap<String, Arc<ActiveSession>>>,
     /// Sessions Polymorfa reported logged out; not taken again until restart.
     retired: RwLock<HashSet<String>>,
@@ -151,6 +153,11 @@ impl Node {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             master: MasterKey::new(&cfg.master_key),
+            lease_holder: format!(
+                "{}:{}",
+                cfg.node_id,
+                hex::encode(rand::random::<[u8; 16]>())
+            ),
             cfg: Arc::new(cfg),
             backend: Arc::new(backend),
             sessions: RwLock::new(HashMap::new()),
@@ -365,7 +372,7 @@ impl Node {
                 None => {
                     let acquired = self
                         .backend
-                        .acquire(id, &self.cfg.node_id, now_ms(), ttl)
+                        .acquire(id, &self.lease_holder, now_ms(), ttl)
                         .await;
                     match acquired {
                         Ok(Some(lease)) => {
@@ -616,8 +623,11 @@ impl Handler for Node {
 
     async fn disconnected(&self) {
         *self.link.write().expect("link lock") = None;
-        for session in self.sessions() {
-            session.claimed.store(false, Ordering::SeqCst);
+        // A new socket must claim a strictly higher generation. Relinquish
+        // these fences before reconnect so the durable store increments them.
+        let ids: Vec<_> = self.sessions().iter().map(|s| s.id.clone()).collect();
+        for id in ids {
+            self.release(&id).await;
         }
     }
 }

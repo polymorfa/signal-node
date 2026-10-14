@@ -126,12 +126,13 @@ impl RecordStore for PostgresStore {
 
     async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> Result<()> {
         let mut tx = self.begin("write").await?;
-        let current: Option<i64> =
-            sqlx::query_scalar("SELECT generation FROM signal_leases WHERE scope = $1 FOR SHARE")
-                .bind(&*fence.scope)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| db_error("write fence check", e))?;
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM signal_leases WHERE scope = $1 AND holder <> '' FOR SHARE",
+        )
+        .bind(&*fence.scope)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_error("write fence check", e))?;
         if current.map(to_u64) != Some(fence.generation) {
             return Err(fence_lost(fence));
         }

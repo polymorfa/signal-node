@@ -137,3 +137,46 @@ async fn sql_records_cannot_be_swapped_between_scope_namespace_or_key() {
         b"sealed-secret-fixture"
     );
 }
+
+#[tokio::test]
+async fn released_sql_fences_cannot_write_before_the_next_takeover() {
+    let store = SqliteStore::connect("sqlite::memory:", 1).await.unwrap();
+    let lease = store
+        .acquire("released", "a", 0, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    store.release(&lease).await.unwrap();
+    assert!(is_fence_lost(
+        &store
+            .write(
+                &lease.fence,
+                &[WriteOp::Put {
+                    ns: Namespace::Device,
+                    key: "local".into(),
+                    value: vec![1]
+                }]
+            )
+            .await
+            .unwrap_err()
+    ));
+    if let Ok(url) = std::env::var("SIGNAL_NODE_TEST_POSTGRES_URL") {
+        let store = PostgresStore::connect(&url, 2).await.unwrap();
+        let scope = format!("released-{}", rand::random::<u64>());
+        let lease = store.acquire(&scope, "a", 0, 1000).await.unwrap().unwrap();
+        store.release(&lease).await.unwrap();
+        assert!(is_fence_lost(
+            &store
+                .write(
+                    &lease.fence,
+                    &[WriteOp::Put {
+                        ns: Namespace::Device,
+                        key: "local".into(),
+                        value: vec![1]
+                    }]
+                )
+                .await
+                .unwrap_err()
+        ));
+    }
+}

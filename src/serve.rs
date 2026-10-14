@@ -24,6 +24,7 @@ use wacore_recordstore::{Namespace, RecordStore, Sealer};
 use wacore_signal_ops::{
     OpsError, ReceiveKind, ReceiveRequest, Received, RetryRequest, RetryRoute,
 };
+use waproto::whatsapp as wa;
 
 fn respond(result: Out) -> Result<ServiceResponse, proto::Error> {
     Ok(ServiceResponse {
@@ -123,7 +124,8 @@ pub async fn handle(
                 RetryRoute::Group {
                     addressing_mode: match request.addressing_mode.as_str() {
                         "lid" => AddressingMode::Lid,
-                        _ => AddressingMode::Pn,
+                        "pn" => AddressingMode::Pn,
+                        _ => return Err(invalid("group addressing_mode must be pn or lid")),
                     },
                 }
             } else if request.is_broadcast {
@@ -255,11 +257,16 @@ async fn receive(
         Received::Message(message) => message,
     };
 
-    let app_state_key_share = message
-        .app_state_key_share
-        .as_ref()
-        .map(message::encode)
-        .unwrap_or_default();
+    // Defense at the wire boundary as well as the pinned Signal core gate.
+    let app_state_key_share = if receive.is_from_me {
+        message
+            .app_state_key_share
+            .as_ref()
+            .map(message::encode)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if let Some(event) = event_for(node, session, &receive, &message) {
         let kind = event.kind;
         if let Err(e) = node.delivery.deliver(event).await {
@@ -320,21 +327,30 @@ fn event_for(
         history: None,
         message_proto: String::new(),
     };
-    // Requests are content-level protocol traffic, not customer messages.
-    // Cellar 1049950004 WAWebHandleMsgProcess.js:218-228 dispatches these separately.
-    if content
-        .message
-        .protocol_message
-        .as_option()
-        .is_some_and(|protocol| {
-            protocol.app_state_sync_key_request.is_set()
-                || protocol.peer_data_operation_request_message.is_set()
-        })
-    {
+    // Protocol fields are independent of ordinary fields in waE2E.Message.
+    // Preserve mixed-message content while removing protocol keys/descriptors
+    // from its application protobuf (including history when consent is off).
+    let mut app_message = content.message.clone();
+    app_message.protocol_message = Default::default();
+    app_message.sender_key_distribution_message = Default::default();
+    let has_app_content = !message::encode(&app_message).is_empty();
+    let has_protocol_request =
+        content
+            .message
+            .protocol_message
+            .as_option()
+            .is_some_and(|protocol| {
+                protocol.app_state_sync_key_request.is_set()
+                    || protocol.peer_data_operation_request_message.is_set()
+                    || matches!(protocol.r#type, Some(wa::message::protocol_message::Type::AppStateSyncKeyShare | wa::message::protocol_message::Type::AppStateSyncKeyRequest | wa::message::protocol_message::Type::PeerDataOperationRequestMessage | wa::message::protocol_message::Type::PeerDataOperationRequestResponseMessage))
+            });
+    if has_protocol_request && !has_app_content {
         return None;
     }
     if let Some(protocol) = &content.protocol_message {
-        if let Some(history) = &protocol.history_sync_notification {
+        if let Some(history) = &protocol.history_sync_notification
+            && !has_app_content
+        {
             // History comes only from this account's own devices.
             if !node.cfg.deliver_history || !receive.is_from_me {
                 tracing::debug!(session = %session.id, "history notification not delivered (history delivery is off)");
@@ -345,17 +361,28 @@ fn event_for(
                 ..base("history.sync")
             });
         }
-        if protocol.app_state_sync_key_share.is_some()
-            || protocol.peer_data_operation_request_response.is_some()
+        if !has_app_content
+            && (protocol.app_state_sync_key_share.is_some()
+                || protocol.peer_data_operation_request_response.is_some())
         {
             return None;
         }
     }
-    let wa_message = &content.message;
+    let wa_message = if has_app_content {
+        &app_message
+    } else {
+        &content.message
+    };
     Some(Event {
         text: message::text_of(wa_message),
         media: message::media_of(wa_message),
         message_proto: base64_of(&message::encode(wa_message)),
+        history: content
+            .protocol_message
+            .as_ref()
+            .and_then(|p| p.history_sync_notification.as_ref())
+            .filter(|_| node.cfg.deliver_history && receive.is_from_me)
+            .map(message::history_descriptor),
         ..base("message")
     })
 }

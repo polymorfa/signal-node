@@ -27,6 +27,7 @@ struct State {
     connections: Mutex<HashMap<String, mpsc::UnboundedSender<proto::Frame>>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<proto::Frame>>>,
     claims: Mutex<HashMap<String, (u64, String)>>,
+    disconnects: Mutex<HashMap<String, oneshot::Sender<()>>>,
     next: AtomicU64,
     sends: Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
     bundles: Mutex<HashMap<String, proto::Bundle>>,
@@ -70,6 +71,7 @@ impl Hub {
             connections: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             claims: Mutex::new(HashMap::new()),
+            disconnects: Mutex::new(HashMap::new()),
             next: AtomicU64::new(10000),
             sends: Mutex::new(vec![]),
             bundles: Mutex::new(HashMap::new()),
@@ -93,6 +95,14 @@ impl Hub {
                     };
                     assert_eq!(hello.protocol_version, 1);
                     let node_id = hello.node_id;
+                    let connection_id =
+                        format!("{node_id}:{}", state.next.fetch_add(1, Ordering::SeqCst));
+                    let (disconnect_tx, mut disconnect_rx) = oneshot::channel();
+                    state
+                        .disconnects
+                        .lock()
+                        .await
+                        .insert(node_id.clone(), disconnect_tx);
                     sink.send(tungstenite::Message::Binary(
                         proto::Frame::with(
                             0,
@@ -116,6 +126,7 @@ impl Hub {
                         .insert(node_id.clone(), tx.clone());
                     loop {
                         tokio::select! {
+                            _ = &mut disconnect_rx => break,
                             out = rx.recv() => {
                                 let Some(frame) = out else { break };
                                 if sink.send(tungstenite::Message::Binary(frame.encode_to_vec().into())).await.is_err() { break; }
@@ -130,10 +141,10 @@ impl Hub {
                                         let result = match op {
                                             service_request::Op::ClaimSession(claim) => {
                                                 let mut claims = state.claims.lock().await;
-                                                if claims.get(&request.session_id).is_some_and(|(generation, _)| *generation > claim.generation) {
+                                                if claims.get(&request.session_id).is_some_and(|(generation, owner)| *generation > claim.generation || *generation == claim.generation && *owner != connection_id) {
                                                     failure = Some(proto::Error::new(proto::Code::NotLeaseHolder, "stale claim"));
                                                 } else {
-                                                    claims.insert(request.session_id.clone(), (claim.generation, node_id.clone()));
+                                                    claims.insert(request.session_id.clone(), (claim.generation, connection_id.clone()));
                                                 }
                                                 runner_response::Result::SessionClaimed(proto::SessionClaimed { state: proto::session_event::State::Connected as i32, pn: "222:1@s.whatsapp.net".into(), lid: String::new() })
                                             }
@@ -196,6 +207,16 @@ impl Hub {
             .await
             .unwrap()
             .unwrap()
+    }
+    pub async fn disconnect(&self, node: &str) {
+        self.state
+            .disconnects
+            .lock()
+            .await
+            .remove(node)
+            .unwrap()
+            .send(())
+            .unwrap();
     }
     pub async fn bundle(&self, jid: &str, bundle: proto::Bundle) {
         self.state.bundles.lock().await.insert(jid.into(), bundle);

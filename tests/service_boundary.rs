@@ -679,3 +679,199 @@ async fn expired_holder_refuses_requests_and_old_callbacks_preserve_new_generati
     );
     old.node.shutdown().await;
 }
+
+#[tokio::test]
+async fn process_incarnations_with_the_same_node_id_cannot_share_a_fence() {
+    let records = Arc::new(MemoryRecordStore::new());
+    let cfg = config("same-stable-node", "ws://127.0.0.1:1/signal", false);
+    let first = signal_node::node::Node::new(cfg.clone(), Backend::Memory(records.clone()));
+    let replacement = signal_node::node::Node::new(cfg, Backend::Memory(records));
+    first.tick_leases().await;
+    let old = first.session(SESSION).unwrap();
+    let ops = old.ops_or_create().await.unwrap();
+    replacement.tick_leases().await;
+    assert!(
+        replacement.session(SESSION).is_none(),
+        "an active lease cannot be reacquired by another process with the same node ID"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+    replacement.tick_leases().await;
+    assert!(replacement.session(SESSION).unwrap().generation > old.generation);
+    assert!(ops.generate_prekeys(1).await.unwrap_err().is_fence_lost());
+    first.shutdown().await;
+    replacement.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_retry_rejects_unknown_or_missing_addressing_mode() {
+    let hub = Hub::start().await;
+    let running = start(
+        &hub,
+        "node-group-validation",
+        Backend::Memory(Arc::new(MemoryRecordStore::new())),
+        false,
+    )
+    .await;
+    let generation = running.node.session(SESSION).unwrap().generation;
+    identity(&hub, "node-group-validation", generation).await;
+    for mode in ["", "unknown"] {
+        let response = hub
+            .command(
+                "node-group-validation",
+                generation,
+                Op::Resend(proto::Resend {
+                    chat: "123@g.us".into(),
+                    requester: "111:1@s.whatsapp.net".into(),
+                    is_group: true,
+                    addressing_mode: mode.into(),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        assert!(
+            matches!(response.body, Some(Body::Error(error)) if error.code_enum()==proto::Code::InvalidArgument)
+        );
+    }
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_history() {
+    for (protocol, from_me) in [
+        (
+            wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
+                app_state_sync_key_share: Some(wa::message::AppStateSyncKeyShare {
+                    keys: vec![wa::message::AppStateSyncKey {
+                        key_id: Some(wa::message::AppStateSyncKeyId {
+                            key_id: Some(vec![3; 32]),
+                        })
+                        .into(),
+                        key_data: Some(wa::message::AppStateSyncKeyData {
+                            key_data: Some(vec![4; 32]),
+                            ..Default::default()
+                        })
+                        .into(),
+                    }],
+                })
+                .into(),
+                ..Default::default()
+            },
+            false,
+        ),
+        (
+            wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::HistorySyncNotification),
+                history_sync_notification: Some(wa::message::HistorySyncNotification {
+                    direct_path: Some("/never-release-without-consent".into()),
+                    media_key: Some(vec![5; 32]),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            true,
+        ),
+        (
+            wa::message::ProtocolMessage {
+                r#type: Some(
+                    wa::message::protocol_message::Type::PeerDataOperationRequestResponseMessage,
+                ),
+                peer_data_operation_request_response_message: Some(
+                    wa::message::PeerDataOperationRequestResponseMessage::default(),
+                )
+                .into(),
+                ..Default::default()
+            },
+            false,
+        ),
+    ] {
+        let hub = Hub::start().await;
+        let running = start(
+            &hub,
+            "node-mixed",
+            Backend::Memory(Arc::new(MemoryRecordStore::new())),
+            false,
+        )
+        .await;
+        let generation = running.node.session(SESSION).unwrap().generation;
+        let ciphertext = encrypted(
+            &hub,
+            "node-mixed",
+            &running,
+            wa::Message {
+                conversation: Some("mixed-user-content".into()),
+                protocol_message: Some(protocol).into(),
+                ..Default::default()
+            },
+            from_me,
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}", running.http_addr);
+        let mut stream = client
+            .get(format!("{url}/v1/events"))
+            .bearer_auth(APP_SECRET)
+            .send()
+            .await
+            .unwrap()
+            .bytes_stream();
+        let command = hub.command("node-mixed", generation, Op::Receive(ciphertext));
+        let app = async {
+            let event = next_event(&mut stream).await;
+            assert_eq!(event["text"], "mixed-user-content");
+            assert_eq!(event["type"], "message");
+            assert!(event.get("history").is_none());
+            use base64::Engine as _;
+            let message = waproto::codec::message_decode(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(event["message_proto"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!message.protocol_message.is_set());
+            assert_eq!(
+                client
+                    .post(format!(
+                        "{url}/v1/events/{}/ack",
+                        event["id"].as_str().unwrap()
+                    ))
+                    .bearer_auth(APP_SECRET)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                204
+            );
+        };
+        let (response, ()) = tokio::join!(command, app);
+        assert!(
+            matches!(response.body, Some(Body::ServiceResponse(proto::ServiceResponse {result: Some(Out::Receive(proto::ReceiveResult { app_state_key_share, .. }))})) if app_state_key_share.is_empty())
+        );
+        drop(stream);
+        running.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn reconnect_claims_a_strictly_higher_durable_generation() {
+    let hub = Hub::start().await;
+    let running = start(
+        &hub,
+        "node-reconnect",
+        Backend::Memory(Arc::new(MemoryRecordStore::new())),
+        false,
+    )
+    .await;
+    let first = running.node.session(SESSION).unwrap().generation;
+    hub.disconnect("node-reconnect").await;
+    wait(|| {
+        running
+            .node
+            .session(SESSION)
+            .is_some_and(|s| s.generation > first && s.is_claimed())
+    })
+    .await;
+    assert!(running.node.session(SESSION).unwrap().generation > first);
+    running.shutdown().await;
+}

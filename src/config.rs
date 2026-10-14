@@ -462,8 +462,15 @@ impl Config {
             self.http.secret_file.as_deref(),
             "http.secret",
         )?;
-        if http_secret.expose().len() < 16 {
-            return Err(invalid("http.secret must be at least 16 characters"));
+        if http_secret.expose().len() < 16
+            || !http_secret
+                .expose()
+                .bytes()
+                .all(|b| (33..=126).contains(&b))
+        {
+            return Err(invalid(
+                "http.secret must contain at least 16 visible ASCII characters without spaces",
+            ));
         }
         let webhook_secret = secret_or_file(
             self.delivery.webhook_secret,
@@ -654,6 +661,15 @@ mod tests {
         }
         let error = Config::from_toml("http = secret-material-not-toml").unwrap_err();
         assert!(!format!("{error:?} {error}").contains("secret-material"));
+        for secret in [
+            "non-ascii-çççççççç",
+            "line-break-secret\n",
+            "space-in secret-value",
+        ] {
+            let mut config = Config::from_toml(MINIMAL).unwrap();
+            config.http.secret = Secret::new(secret);
+            assert!(config.resolve().is_err());
+        }
         let mut config = Config::from_toml(MINIMAL).unwrap();
         config.retention.decrypt_buffer_hours = u64::MAX;
         assert!(config.resolve().is_err());

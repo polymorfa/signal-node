@@ -17,7 +17,7 @@ fn opt_b64(bytes: &Option<Vec<u8>>) -> Option<String> {
 }
 
 /// One event delivered to the application, by webhook or event stream.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Event {
     /// Stable across redeliveries of the same ciphertext; use it to
     /// deduplicate and to acknowledge.
@@ -49,7 +49,7 @@ pub struct Event {
 }
 
 /// Where to download one media attachment and how to decrypt it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaDescriptor {
     /// `image`, `video`, `audio`, `document` or `sticker`.
     pub kind: String,
@@ -86,7 +86,7 @@ pub struct MediaDescriptor {
 
 /// A history-sync notification: where the chunk is and how to decrypt it.
 /// signal-node never downloads history.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct HistoryDescriptor {
     pub sync_type: Option<i32>,
     pub chunk_order: Option<u32>,
@@ -103,6 +103,17 @@ pub struct HistoryDescriptor {
     /// Base64 of the serialized `HistorySyncNotification`.
     pub notification_proto: String,
 }
+
+macro_rules! redacted_debug {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl std::fmt::Debug for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(concat!(stringify!($ty), "(<redacted>)"))
+            }
+        }
+    )+};
+}
+redacted_debug!(Event, MediaDescriptor, HistoryDescriptor, SendRequest);
 
 /// The text a person would read: the body, or a media caption.
 pub fn text_of(message: &wa::Message) -> Option<String> {
@@ -221,7 +232,7 @@ pub fn encode<M: waproto::buffa::Message>(message: &M) -> Vec<u8> {
 }
 
 /// What the application asks to send.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendRequest {
     /// A user (`15551234567@s.whatsapp.net`, or a LID) or a group
@@ -475,5 +486,32 @@ mod tests {
             build_message(&request, 0),
             Err(BuildError::UnknownKind(_))
         ));
+    }
+    #[test]
+    fn debug_never_prints_application_text_or_descriptors() {
+        let request = SendRequest {
+            to: "111@s.whatsapp.net".into(),
+            text: Some("private-plaintext".into()),
+            media: None,
+        };
+        assert_eq!(format!("{request:?}"), "SendRequest(<redacted>)");
+        let descriptor = MediaDescriptor {
+            kind: "image".into(),
+            direct_path: "/private".into(),
+            media_key: "private-key".into(),
+            file_sha256: "h".into(),
+            file_enc_sha256: "e".into(),
+            file_length: 1,
+            mimetype: "image/png".into(),
+            url: Some("https://private.invalid/?auth=private-auth".into()),
+            caption: None,
+            file_name: None,
+            width: None,
+            height: None,
+            seconds: None,
+            ptt: None,
+            media_key_timestamp: None,
+        };
+        assert_eq!(format!("{descriptor:?}"), "MediaDescriptor(<redacted>)");
     }
 }

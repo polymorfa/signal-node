@@ -88,12 +88,13 @@ impl SqliteStore {
     }
 
     async fn write_in(conn: &mut Conn, fence: &Fence, ops: &[WriteOp]) -> Result<()> {
-        let current: Option<i64> =
-            sqlx::query_scalar("SELECT generation FROM signal_leases WHERE scope = ?")
-                .bind(&*fence.scope)
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|e| db_error("write fence check", e))?;
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM signal_leases WHERE scope = ? AND holder <> ''",
+        )
+        .bind(&*fence.scope)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|e| db_error("write fence check", e))?;
         if current.map(to_u64) != Some(fence.generation) {
             return Err(FenceLost {
                 scope: fence.scope.clone(),
