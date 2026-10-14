@@ -1,0 +1,58 @@
+[package]
+name = "signal-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "AGPL-3.0-only"
+description = "Self-hosted Signal service for Polymorfa zero-knowledge sessions"
+repository = "https://github.com/polymorfa/signal-node"
+publish = false
+
+[lib]
+name = "signal_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "signal-node"
+path = "src/main.rs"
+
+[dependencies]
+# Signal core, pinned to polymorfa/whatsapp-rust branch polymorfa/recordstore.
+wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229" }
+wacore-binary = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229" }
+wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229" }
+wacore-signal-ops = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229" }
+waproto = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229" }
+
+aes-gcm = "0.10"
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+base64 = "0.22"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
+hmac = "0.12"
+prost = "0.14"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "sqlite", "migrate", "macros"] }
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.9"
+
+[dev-dependencies]
+wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "b69bc85b5242d48047b87c2189d30693c247b229", features = ["conformance"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
