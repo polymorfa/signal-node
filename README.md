@@ -8,10 +8,18 @@ This repository is private. The implementation is under review and has not been 
 
 - Runner protocol: [`proto/polymorfa/signal/v1/signal_service.proto`](proto/polymorfa/signal/v1/signal_service.proto), version `1`, subprotocol `polymorfa.signal.v1`, originating at `b6d5f5f`.
 - Application API: [`docs/app-api.openapi.json`](docs/app-api.openapi.json). JSON field names use snake_case. Event and message timestamps use Unix seconds; lease expiry uses Unix milliseconds internally.
-- Signal libraries: exact `polymorfa/whatsapp-rust` revision `b69bc85b5242d48047b87c2189d30693c247b229`, the unmerged [recordstore/Signal operations producer PR](https://github.com/polymorfa/whatsapp-rust/pull/5). A successful local build does not make that producer a released dependency.
+- Signal libraries: exact `polymorfa/whatsapp-rust` revision `4b3b13cacd40a27573d0246386db553ef887539b`, the unmerged [recordstore/Signal operations producer PR](https://github.com/polymorfa/whatsapp-rust/pull/5). All five normal/dev crate families use this same source. A successful local build does not make that producer a released dependency.
 - Rust MSRV: `1.94`. The checked-in toolchain selects `1.94.0`.
 
 The server connection uses a project credential in `Authorization`, never in a URL or browser. The local API uses a separate application bearer secret. It rejects every authenticated request with an `Origin` header, including `Origin: null`, and supplies no CORS permission. Browser/WASM remote transport is unavailable until Polymorfa provides a distinct, short-lived client grant backed by live authorization. Never put the project credential or application secret in a browser.
+
+## Durable public prekey uploads
+
+The additive runner operations `PreparePreKeyUpload` and `AcknowledgePreKeyUpload` retain protocol version `1`. Prepare accepts 1..812 and returns the entire surviving pending batch under one opaque token, including after a process or database reopen. A later request for 50 can return the outstanding 812 keys; it never truncates or tops up that batch. Only public keys, IDs and the token cross the runner protocol. Counter, private keys and pending metadata commit atomically in the customer store. Keep one `SignalOps` instance per held session scope, as the service does.
+
+The runner acknowledges only after its upload succeeds, using that token and unique original IDs covering every surviving key. Consumed originals may remain in an in-flight ACK; they stay deleted. Flags, the exact replay receipt and pending retirement commit together. The most recent exact ACK can be repeated after a lost response or restart without changing a newer pending batch. A timeout does not establish whether WhatsApp accepted an upload. Fresh retry-receipt keys still use `GeneratePreKeys` and `MarkPreKeysUploaded`; the legacy mark rejects the entire request if it includes an original pending-batch member, including a consumed member. Uploaded counts describe surviving local flags, not WhatsApp's remaining pool.
+
+Upgrade the supporting service before a runner requires these operations. An older service rejects an unknown operation with `CODE_UNSUPPORTED`; the runner must fail without falling back to fresh generation. The matching HyperMeow/backend consumers remain separate unmerged dependencies. This library/service checkpoint does not establish live-provider retry acceptance or change application HTTP routes, consent, custody, eligibility or deployment availability. Rollback must retain the sealed device, private-key and batch records; do not run an older writer over active pending batches without verifying compatible batch-aware behavior.
 
 ## Run
 

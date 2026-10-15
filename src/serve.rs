@@ -10,8 +10,8 @@
 use crate::message::{self, Event};
 use crate::node::{ActiveSession, Node};
 use crate::proto::{
-    self, Code, DecryptFailure, Identity, MigrateResult, PreKey, PreKeyCount, PreKeys,
-    ReceiveResult, ServiceResponse, SignedPairing, Stanza, runner_request::Op,
+    self, Code, DecryptFailure, Identity, MigrateResult, PreKey, PreKeyCount, PreKeyUploadBatch,
+    PreKeys, ReceiveResult, ServiceResponse, SignedPairing, Stanza, runner_request::Op,
     service_response::Result as Out,
 };
 use crate::resolver::{RemoteResolver, remote_bundle};
@@ -20,7 +20,6 @@ use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::types::jid::JidExt as _;
 use wacore::types::message::AddressingMode;
 use wacore_binary::Jid;
-use wacore_recordstore::{Namespace, RecordStore, Sealer};
 use wacore_signal_ops::{
     OpsError, ReceiveKind, ReceiveRequest, Received, RetryRequest, RetryRoute,
 };
@@ -86,6 +85,29 @@ pub async fn handle(
         }
         Op::MarkPreKeysUploaded(request) => {
             ops.mark_prekeys_uploaded(&request.ids)
+                .await
+                .map_err(fail)?;
+            respond(Out::Ok(proto::Ok {}))
+        }
+        Op::PreparePreKeyUpload(request) => {
+            let batch = ops
+                .prepare_prekey_upload(request.count)
+                .await
+                .map_err(fail)?;
+            respond(Out::PreKeyUploadBatch(PreKeyUploadBatch {
+                batch_id: batch.batch_id,
+                pre_keys: batch
+                    .pre_keys
+                    .into_iter()
+                    .map(|key| PreKey {
+                        id: key.id,
+                        public_key: key.public_key.to_vec(),
+                    })
+                    .collect(),
+            }))
+        }
+        Op::AcknowledgePreKeyUpload(request) => {
+            ops.acknowledge_prekey_upload(&request.batch_id, &request.ids)
                 .await
                 .map_err(fail)?;
             respond(Out::Ok(proto::Ok {}))
@@ -392,52 +414,13 @@ fn base64_of(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Same slot binding as `wacore-recordstore` (`RecordSignalStore::aad`):
-/// length-prefixed domain, scope, namespace tag and key.
-fn record_aad(scope: &str, ns: Namespace, key: &str) -> Vec<u8> {
-    let mut aad = Vec::new();
-    for part in [
-        b"wacore-recordstore/v1".as_slice(),
-        scope.as_bytes(),
-        ns.tag().as_bytes(),
-        key.as_bytes(),
-    ] {
-        aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
-        aad.extend_from_slice(part);
-    }
-    aad
-}
-
-/// One-time prekeys stored and marked uploaded. `wacore-signal-ops` has no
-/// count operation, so the upload flag (first plaintext byte, 1 = uploaded)
-/// is read directly from each sealed prekey record.
+/// Surviving uploaded keys in customer-local state, not a provider pool count.
 pub async fn uploaded_prekey_count(
     node: &Node,
     session: &ActiveSession,
 ) -> Result<u32, proto::Error> {
-    let unavailable = |_| proto::Error::new(Code::Unavailable, "storage is unavailable");
-    let backend = node.backend();
-    let keys = backend
-        .scan_keys(&session.id, Namespace::PreKey, "", None)
+    session
+        .uploaded_prekey_count()
         .await
-        .map_err(unavailable)?;
-    let mut count = 0u32;
-    for key in keys {
-        let Some(sealed) = backend
-            .get(&session.id, Namespace::PreKey, &key)
-            .await
-            .map_err(unavailable)?
-        else {
-            continue;
-        };
-        let plain = session
-            .sealer
-            .open(&record_aad(&session.id, Namespace::PreKey, &key), &sealed)
-            .await
-            .map_err(|_| proto::Error::new(Code::Internal, "a prekey record did not open"))?;
-        if plain.first() == Some(&1) {
-            count += 1;
-        }
-    }
-    Ok(count)
+        .map_err(|error| node.ops_error(session, &error))
 }

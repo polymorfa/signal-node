@@ -24,13 +24,38 @@ use tokio_tungstenite::tungstenite;
 pub const APP_SECRET: &str = "fixture-application-secret";
 pub const SESSION: &str = "session-fixture";
 struct State {
-    connections: Mutex<HashMap<String, mpsc::UnboundedSender<proto::Frame>>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<proto::Frame>>>,
+    connections: Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    pending: Mutex<HashMap<u64, PendingReply>>,
     claims: Mutex<HashMap<String, (u64, String)>>,
     disconnects: Mutex<HashMap<String, oneshot::Sender<()>>>,
     next: AtomicU64,
     sends: Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
     bundles: Mutex<HashMap<String, proto::Bundle>>,
+}
+enum PendingReply {
+    Frame(oneshot::Sender<proto::Frame>),
+    Lost(oneshot::Sender<()>),
+}
+impl PendingReply {
+    fn complete(self, frame: proto::Frame) {
+        match self {
+            Self::Frame(sender) => {
+                let _ = sender.send(frame);
+            }
+            // Deliberately discard the serialized service response while
+            // informing the test that it reached the transport boundary.
+            Self::Lost(sender) => {
+                let _ = sender.send(());
+            }
+        }
+    }
+}
+#[derive(prost::Message)]
+struct RawRunnerFrame {
+    #[prost(uint64, tag = "1")]
+    id: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    request: Vec<u8>,
 }
 struct ContractHandshake;
 impl tungstenite::handshake::server::Callback for ContractHandshake {
@@ -118,7 +143,7 @@ impl Hub {
                     ))
                     .await
                     .unwrap();
-                    let (tx, mut rx) = mpsc::unbounded_channel::<proto::Frame>();
+                    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
                     state
                         .connections
                         .lock()
@@ -129,7 +154,7 @@ impl Hub {
                             _ = &mut disconnect_rx => break,
                             out = rx.recv() => {
                                 let Some(frame) = out else { break };
-                                if sink.send(tungstenite::Message::Binary(frame.encode_to_vec().into())).await.is_err() { break; }
+                                if sink.send(tungstenite::Message::Binary(frame.into())).await.is_err() { break; }
                             }
                             incoming = stream.next() => {
                                 let Some(Ok(tungstenite::Message::Binary(bytes))) = incoming else { break };
@@ -159,13 +184,13 @@ impl Hub {
                                             _ => panic!("Unexpected fixture lookup"),
                                         };
                                         let body = match failure { Some(error) => Body::Error(error), None => Body::RunnerResponse(proto::RunnerResponse { result: Some(result) }) };
-                                        tx.send(proto::Frame::with(frame.id, body)).unwrap();
+                                        tx.send(proto::Frame::with(frame.id, body).encode_to_vec()).unwrap();
                                     }
                                     Some(Body::ServiceResponse(response)) => {
-                                        if let Some(pending) = state.pending.lock().await.remove(&frame.id) { let _ = pending.send(proto::Frame::with(frame.id, Body::ServiceResponse(response))); }
+                                        if let Some(pending) = state.pending.lock().await.remove(&frame.id) { pending.complete(proto::Frame::with(frame.id, Body::ServiceResponse(response))); }
                                     }
                                     Some(Body::Error(error)) => {
-                                        if let Some(pending) = state.pending.lock().await.remove(&frame.id) { let _ = pending.send(proto::Frame::with(frame.id, Body::Error(error))); }
+                                        if let Some(pending) = state.pending.lock().await.remove(&frame.id) { pending.complete(proto::Frame::with(frame.id, Body::Error(error))); }
                                     }
                                     _ => panic!("Unexpected fixture frame"),
                                 }
@@ -183,9 +208,27 @@ impl Hub {
         generation: u64,
         op: proto::runner_request::Op,
     ) -> proto::Frame {
+        self.request(
+            node,
+            proto::RunnerRequest {
+                session_id: SESSION.into(),
+                lease_generation: generation,
+                op: Some(op),
+            },
+        )
+        .await
+    }
+    pub async fn request(&self, node: &str, request: proto::RunnerRequest) -> proto::Frame {
+        self.raw_request(node, request.encode_to_vec()).await
+    }
+    pub async fn raw_request(&self, node: &str, request: Vec<u8>) -> proto::Frame {
         let id = self.state.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.state.pending.lock().await.insert(id, tx);
+        self.state
+            .pending
+            .lock()
+            .await
+            .insert(id, PendingReply::Frame(tx));
         let out = self
             .state
             .connections
@@ -194,19 +237,49 @@ impl Hub {
             .get(node)
             .unwrap()
             .clone();
-        out.send(proto::Frame::with(
-            id,
-            Body::RunnerRequest(proto::RunnerRequest {
-                session_id: SESSION.into(),
-                lease_generation: generation,
-                op: Some(op),
-            }),
-        ))
-        .unwrap();
+        out.send(RawRunnerFrame { id, request }.encode_to_vec())
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), rx)
             .await
             .unwrap()
             .unwrap()
+    }
+    pub async fn request_losing_response(&self, node: &str, request: proto::RunnerRequest) {
+        let id = self.state.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.state
+            .pending
+            .lock()
+            .await
+            .insert(id, PendingReply::Lost(tx));
+        self.state
+            .connections
+            .lock()
+            .await
+            .get(node)
+            .unwrap()
+            .send(
+                RawRunnerFrame {
+                    id,
+                    request: request.encode_to_vec(),
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    pub async fn send_unanswered_frame(&self, node: &str, bytes: Vec<u8>) {
+        self.state
+            .connections
+            .lock()
+            .await
+            .get(node)
+            .unwrap()
+            .send(bytes)
+            .unwrap();
     }
     pub async fn disconnect(&self, node: &str) {
         self.state

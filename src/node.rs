@@ -63,7 +63,6 @@ pub struct ActiveSession {
     pub generation: u64,
     lease: Mutex<Lease>,
     store: Arc<Store>,
-    pub(crate) sealer: Arc<AesGcmSealer>,
     ops: OnceCell<Arc<Ops>>,
     claimed: AtomicBool,
     claiming: AtomicBool,
@@ -76,6 +75,11 @@ impl ActiveSession {
     /// The Signal operations, if the device keys exist.
     pub fn ops(&self) -> Option<Arc<Ops>> {
         self.ops.get().cloned()
+    }
+
+    /// Surviving local uploaded prekeys, checked against this store's fence.
+    pub(crate) async fn uploaded_prekey_count(&self) -> Result<u32, OpsError> {
+        Ok(self.store.uploaded_prekey_count().await?)
     }
 
     /// The Signal operations, creating the device keys on first use.
@@ -294,7 +298,7 @@ impl Node {
         let sealer = Arc::new(AesGcmSealer::new(&data_key));
         let store = Arc::new(RecordSignalStore::new(
             self.backend.clone(),
-            sealer.clone(),
+            sealer,
             lease.fence.clone(),
         ));
         let ops = OnceCell::new();
@@ -310,7 +314,6 @@ impl Node {
             generation: lease.fence.generation,
             lease: Mutex::new(lease),
             store,
-            sealer,
             ops,
             claimed: AtomicBool::new(false),
             claiming: AtomicBool::new(false),

@@ -99,6 +99,8 @@ message RunnerRequest {
     Resend resend = 17;
     ForgetIdentity forget_identity = 18;
     MigratePnToLid migrate_pn_to_lid = 19;
+    PreparePreKeyUpload prepare_pre_key_upload = 20;
+    AcknowledgePreKeyUpload acknowledge_pre_key_upload = 21;
   }
 }
 
@@ -113,6 +115,7 @@ message ServiceResponse {
     SignedPairing signed_pairing = 15;
     Stanza stanza = 16;
     MigrateResult migrate = 17;
+    PreKeyUploadBatch pre_key_upload_batch = 18;
   }
 }
 
@@ -221,7 +224,30 @@ message ReceiveResult {
 }
 
 message GeneratePreKeys {
+  // Fresh keys for retry receipts, not ordinary public upload recovery.
+  // Integer count 1..812.
   uint32 count = 1;
+}
+
+message PreparePreKeyUpload {
+  // Fresh allocation size 1..812. An outstanding live batch is returned in
+  // full and original order, even when its size differs from this count.
+  uint32 count = 1;
+}
+
+message PreKeyUploadBatch {
+  // Opaque 32-character lowercase hexadecimal token; not an ordering key.
+  string batch_id = 1;
+  // Public keys only, 1..812 entries. Consumed original members are omitted.
+  repeated PreKey pre_keys = 2;
+}
+
+message AcknowledgePreKeyUpload {
+  string batch_id = 1;
+  // Unique original members covering every surviving private key. Consumed
+  // original IDs may remain in an in-flight ACK and are never resurrected.
+  // The most recent exact ACK remains replayable after restart.
+  repeated uint32 ids = 2;
 }
 
 message PreKeys {
@@ -235,6 +261,8 @@ message PreKey {
 }
 
 message MarkPreKeysUploaded {
+  // Fresh retry keys only. Any original pending upload member rejects the
+  // entire call; use AcknowledgePreKeyUpload for durable upload batches.
   repeated uint32 ids = 1;
 }
 
