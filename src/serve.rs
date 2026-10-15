@@ -4,7 +4,7 @@
 //! Serving `RunnerRequest` operations with `wacore-signal-ops`.
 //!
 //! Nothing returned here carries plaintext, with the contract's one
-//! exception: an app-state key share from one of the account's own devices.
+//! exception: an explicitly enabled app-state key share from an own device.
 //! Error messages name the failure, never content or key material.
 
 use crate::message::{self, Event};
@@ -257,8 +257,8 @@ async fn receive(
         Received::Message(message) => message,
     };
 
-    // Defense at the wire boundary as well as the pinned Signal core gate.
-    let app_state_key_share = if receive.is_from_me {
+    // Explicit operator consent in addition to the pinned core own-device gate.
+    let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
         message
             .app_state_key_share
             .as_ref()

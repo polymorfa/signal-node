@@ -79,9 +79,31 @@ The webhook signs the exact request body bytes. Headers are `Signal-Node-Timesta
 
 Only then does the service call `mark_delivered` on its sealed decrypt-buffer record. The runner receives success after that write succeeds. If application acknowledgment or the final write fails, the same ciphertext can replay from the buffer with `redelivered = true`. Application processing and this write cannot form one distributed transaction, so delivery is at least once. Provider redelivery behavior still requires real-account acceptance.
 
-Protocol-only messages such as sender-key distributions and app-state shares do not produce application events; the Signal core processes them locally and marks them consumed without an application ACK. Disabled or foreign-device history notifications also produce no application event. The service never sends decrypted message content in the runner receive response. The protocol permits app-state key shares back to the runner only from the account's own devices. Mixed protocol/text or media messages preserve ordinary application content; their application protobuf omits protocol fields, and history metadata is included only with consent.
+Protocol-only messages such as sender-key distributions and app-state shares do not produce application events; the Signal core processes them locally and marks them consumed without an application ACK. Disabled or foreign-device history notifications also produce no application event. The service never sends decrypted message content in the runner receive response. The service returns app-state key shares to the runner only after explicit operator opt-in and only from the account's own devices. Mixed protocol/text or media messages preserve ordinary application content; their application protobuf omits protocol fields, and history metadata is included only with consent.
 
 SSE buffers at most 1,024 events per connection. A lagging subscriber can miss an event, but it cannot acknowledge an event it never processes. There is no SSE cursor replay or `Last-Event-ID` recovery. Reconnect the stream and rely on runner ciphertext retry plus the sealed buffer for unacknowledged messages. With no webhook and no stream subscriber, receive fails immediately instead of silently dropping an application message. The default acknowledgment timeout is ten seconds.
+
+## App-state key sharing consent
+
+`app_state.share_keys` defaults to `false`. Set it to `true`, or set
+`SIGNAL_NODE_APP_STATE_SHARE_KEYS=true`, only after accepting the metadata disclosure.
+The environment override accepts `1`, `true`, `yes`, `0`, `false`, or `no`;
+other values refuse startup. Keep the setting consistent across deployment replicas.
+This consent is independent of `history.deliver`: neither setting enables the other.
+
+When enabled, the service forwards app-state keys received from the account's own
+devices to the runner. Foreign-device shares remain excluded. These keys allow the
+runner to decrypt synchronized metadata, including contact names, labels and
+mute/archive/pin state. Message-plaintext custody does not imply metadata opacity;
+Polymorfa can also see operational metadata such as blocklists. Disabling the
+setting stops future key forwarding; it cannot recall keys or metadata already
+shared. This operator setting grants no session eligibility or hosted-history access.
+
+Shipped-client evidence is Cellar bundle `whatsapp-1049950004`,
+`WAWebSyncdDecryptMutations.js:24-35` (key-based mutation decryption) and
+`WAWebProtobufSyncAction.pb.js:459-508,1268-1304` (contact, label and chat-state
+fields). This evidence does not establish live-provider acceptance or prove that
+blocklists use those app-state keys.
 
 ## History consent and content limits
 

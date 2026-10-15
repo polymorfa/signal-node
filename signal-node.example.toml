@@ -36,6 +36,11 @@ ack_timeout_ms = 10000
 # Explicit operator consent. This never grants backend session eligibility.
 deliver = false
 
+[app_state]
+# Explicit metadata disclosure consent, independent of history delivery.
+# Own-device keys let the runner decrypt contact names, labels and chat state.
+share_keys = false
+
 [retention]
 decrypt_buffer_hours = 336
 sent_message_hours = 168

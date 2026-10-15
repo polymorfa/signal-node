@@ -80,6 +80,8 @@ pub struct Config {
     #[serde(default)]
     pub history: HistoryConfig,
     #[serde(default)]
+    pub app_state: AppStateConfig,
+    #[serde(default)]
     pub retention: RetentionConfig,
 }
 
@@ -211,6 +213,15 @@ pub struct HistoryConfig {
     pub deliver: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppStateConfig {
+    /// Share own-device app-state keys with the runner. Off by default;
+    /// enabling this discloses the metadata those keys protect.
+    #[serde(default)]
+    pub share_keys: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -294,6 +305,7 @@ pub struct Resolved {
     pub sse: bool,
     pub ack_timeout: Duration,
     pub deliver_history: bool,
+    pub share_app_state_keys: bool,
     pub decrypt_buffer_retention: Duration,
     pub sent_message_retention: Duration,
     pub prune_interval: Duration,
@@ -327,6 +339,7 @@ pub const ENV_VARS: &[&str] = &[
     "SIGNAL_NODE_WEBHOOK_URL",
     "SIGNAL_NODE_WEBHOOK_SECRET",
     "SIGNAL_NODE_HISTORY_DELIVER",
+    "SIGNAL_NODE_APP_STATE_SHARE_KEYS",
 ];
 
 impl Config {
@@ -391,6 +404,17 @@ impl Config {
         }
         if let Some(v) = env("SIGNAL_NODE_HISTORY_DELIVER") {
             self.history.deliver = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Some(v) = env("SIGNAL_NODE_APP_STATE_SHARE_KEYS") {
+            self.app_state.share_keys = match v.as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => {
+                    return Err(invalid(
+                        "SIGNAL_NODE_APP_STATE_SHARE_KEYS must be true or false",
+                    ));
+                }
+            };
         }
         Ok(())
     }
@@ -539,6 +563,7 @@ impl Config {
             sse: self.delivery.sse,
             ack_timeout: Duration::from_millis(self.delivery.ack_timeout_ms),
             deliver_history: self.history.deliver,
+            share_app_state_keys: self.app_state.share_keys,
             decrypt_buffer_retention: Duration::from_secs(buffer_seconds),
             sent_message_retention: Duration::from_secs(sent_seconds),
             prune_interval: Duration::from_secs(prune_seconds),
@@ -605,6 +630,10 @@ mod tests {
         assert_eq!(resolved.sessions, ["sess_a", "sess_b"]);
         assert_eq!(resolved.lease_ttl_ms, 30_000);
         assert!(!resolved.deliver_history, "history must be off by default");
+        assert!(
+            !resolved.share_app_state_keys,
+            "app-state keys must stay local by default"
+        );
         assert!(resolved.sse);
         assert_eq!(resolved.master_key, [0; 32]);
     }
@@ -624,6 +653,52 @@ mod tests {
         assert_eq!(resolved.sessions, ["one", "two"]);
         assert!(resolved.deliver_history);
         assert_eq!(resolved.node_id, "node-9");
+    }
+
+    #[test]
+    fn app_state_consent_is_independent_and_environment_can_revoke_it() {
+        let file = format!("{MINIMAL}\n[app_state]\nshare_keys = true\n");
+        let config = Config::from_toml(&file).unwrap();
+        let resolved = config.clone().resolve().unwrap();
+        assert!(resolved.share_app_state_keys);
+        assert!(!resolved.deliver_history);
+        for (value, enabled) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+        ] {
+            let mut config = config.clone();
+            config
+                .apply_env(|name| {
+                    (name == "SIGNAL_NODE_APP_STATE_SHARE_KEYS").then(|| value.into())
+                })
+                .unwrap();
+            assert_eq!(config.resolve().unwrap().share_app_state_keys, enabled);
+        }
+        let mut config = Config::from_toml(MINIMAL).unwrap();
+        config
+            .apply_env(|name| (name == "SIGNAL_NODE_HISTORY_DELIVER").then(|| "true".into()))
+            .unwrap();
+        let resolved = config.resolve().unwrap();
+        assert!(resolved.deliver_history);
+        assert!(!resolved.share_app_state_keys);
+        assert!(ENV_VARS.contains(&"SIGNAL_NODE_APP_STATE_SHARE_KEYS"));
+        for value in ["", "TRUE", "unexpected-secret-value"] {
+            let mut config = Config::from_toml(MINIMAL).unwrap();
+            let error = config
+                .apply_env(|name| {
+                    (name == "SIGNAL_NODE_APP_STATE_SHARE_KEYS").then(|| value.into())
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "SIGNAL_NODE_APP_STATE_SHARE_KEYS must be true or false"
+            );
+            assert!(!config.app_state.share_keys);
+        }
     }
 
     #[test]

@@ -329,6 +329,103 @@ async fn unacknowledged_receive_replays_across_crash_and_old_holder_is_fenced() 
     second.shutdown().await;
 }
 
+fn app_state_share() -> wa::message::AppStateSyncKeyShare {
+    wa::message::AppStateSyncKeyShare {
+        keys: vec![wa::message::AppStateSyncKey {
+            key_id: Some(wa::message::AppStateSyncKeyId {
+                key_id: Some(vec![3; 32]),
+            })
+            .into(),
+            key_data: Some(wa::message::AppStateSyncKeyData {
+                key_data: Some(vec![4; 32]),
+                ..Default::default()
+            })
+            .into(),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn app_state_keys_require_separate_consent_and_an_own_device() {
+    for (consent, from_me, history) in [
+        (false, true, false),
+        (false, true, true),
+        (true, true, false),
+        (true, false, false),
+    ] {
+        let hub = Hub::start().await;
+        let mut cfg = config("node-app-state", &hub.url, history);
+        assert!(!cfg.share_app_state_keys);
+        cfg.share_app_state_keys = consent;
+        let running = signal_node::start(cfg, Backend::Memory(Arc::new(MemoryRecordStore::new())))
+            .await
+            .unwrap();
+        wait(|| {
+            running
+                .node
+                .session(SESSION)
+                .is_some_and(|s| s.is_claimed())
+        })
+        .await;
+        let generation = running.node.session(SESSION).unwrap().generation;
+        let expected = app_state_share();
+        let receive = encrypted(
+            &hub,
+            "node-app-state",
+            &running,
+            wa::Message {
+                protocol_message: wa::message::ProtocolMessage {
+                    r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
+                    app_state_sync_key_share: Some(expected.clone()).into(),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            from_me,
+        )
+        .await;
+        let mut stream = reqwest::Client::new()
+            .get(format!("http://{}/v1/events", running.http_addr))
+            .bearer_auth(APP_SECRET)
+            .send()
+            .await
+            .unwrap()
+            .bytes_stream();
+        let response = hub
+            .command("node-app-state", generation, Op::Receive(receive.clone()))
+            .await;
+        let Some(Body::ServiceResponse(proto::ServiceResponse {
+            result: Some(Out::Receive(result)),
+        })) = response.body
+        else {
+            panic!("receive response missing");
+        };
+        let expected_bytes = if consent && from_me {
+            signal_node::message::encode(&expected)
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            result.app_state_key_share, expected_bytes,
+            "consent={consent}, own_device={from_me}, history={history}"
+        );
+        let replay = hub
+            .command("node-app-state", generation, Op::Receive(receive))
+            .await;
+        assert!(
+            matches!(replay.body, Some(Body::ServiceResponse(proto::ServiceResponse { result: Some(Out::Receive(proto::ReceiveResult { already_delivered: true, app_state_key_share, .. })) })) if app_state_key_share.is_empty())
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                .await
+                .is_err()
+        );
+        drop(stream);
+        running.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn history_stays_off_until_explicit_consent_and_delivers_only_the_notification() {
     for (consent, from_me) in [(false, true), (true, false), (true, true)] {
@@ -738,6 +835,14 @@ async fn group_retry_rejects_unknown_or_missing_addressing_mode() {
 #[tokio::test]
 async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_history() {
     for (protocol, from_me) in [
+        (
+            wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
+                app_state_sync_key_share: Some(app_state_share()).into(),
+                ..Default::default()
+            },
+            true,
+        ),
         (
             wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
