@@ -45,6 +45,8 @@ pub enum SendError {
     NotPaired,
     #[error("not connected to Polymorfa")]
     Disconnected,
+    #[error("send outcome is unconfirmed; do not automatically resend")]
+    Unconfirmed { message_id: String },
     #[error("Polymorfa refused the send: {0}")]
     Refused(proto::Error),
     #[error("send ceiling reached")]
@@ -152,12 +154,7 @@ pub async fn send(
         });
         let result = match link.request(&session.id, session.generation, op).await {
             Ok(runner_response::Result::Send(result)) => result,
-            Ok(_) => {
-                return Err(SendError::Refused(proto::Error::new(
-                    Code::Internal,
-                    "unexpected answer to SendStanza",
-                )));
-            }
+            Ok(_) => return Err(SendError::Unconfirmed { message_id }),
             Err(LinkError::Remote(error)) => {
                 return Err(match error.code_enum() {
                     Code::RateLimited => SendError::RateLimited,
@@ -172,7 +169,10 @@ pub async fn send(
                     _ => SendError::Refused(error),
                 });
             }
-            Err(_) => return Err(SendError::Disconnected),
+            Err(LinkError::Disconnected) => return Err(SendError::Disconnected),
+            Err(LinkError::Timeout | LinkError::ResponseLost | LinkError::UnexpectedResponse) => {
+                return Err(SendError::Unconfirmed { message_id });
+            }
         };
 
         // WA Web marks the sender key as held once the server acks, before
@@ -181,7 +181,16 @@ pub async fn send(
             && !targets.is_empty()
             && let Err(e) = ops.mark_sender_key_distributed(&to, targets).await
         {
-            return Err(ops_failure(node, session, &e));
+            // The runner has already confirmed the send. A failed local
+            // distribution mark must not invite a new message ID or resend.
+            // Fence loss still retires this session before returning success.
+            node.ops_error(session, &e);
+            tracing::warn!(session = %session.id, message_id = %message_id, "send accepted; sender-key distribution was not recorded");
+            return Ok(SendOutcome {
+                message_id,
+                server_timestamp: result.server_timestamp,
+                resent,
+            });
         }
         tracing::info!(session = %session.id, message_id = %message_id, resent, "sent");
         if result.participant_hash_mismatch && !resent {

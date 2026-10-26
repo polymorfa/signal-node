@@ -125,6 +125,15 @@ async fn send_message(
     };
     match send::send(&node, &session, request).await {
         Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
+        Err(SendError::Unconfirmed { message_id }) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": {
+                "code": "send_unconfirmed",
+                "message": "send outcome is unconfirmed; do not automatically resend",
+                "message_id": message_id,
+            }})),
+        )
+            .into_response(),
         Err(e) => {
             let (status, code) = match &e {
                 SendError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
@@ -146,6 +155,7 @@ async fn send_message(
                     (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
                 }
                 SendError::Build => (StatusCode::BAD_GATEWAY, "send_failed"),
+                SendError::Unconfirmed { .. } => unreachable!("handled above"),
             };
             error(status, code, e.to_string())
         }
@@ -163,7 +173,7 @@ async fn events(
     State(node): State<Arc<Node>>,
     Query(filter): Query<EventFilter>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, Response> {
-    let Some(rx) = node.delivery.subscribe() else {
+    let Some(rx) = node.delivery.subscribe_for(filter.session_id) else {
         return Err(error(
             StatusCode::NOT_FOUND,
             "stream_disabled",
@@ -174,13 +184,6 @@ async fn events(
         // A lagging client misses events; they are not acknowledged, so the
         // receive fails and the message is redelivered later.
         let event = item.ok()?;
-        if filter
-            .session_id
-            .as_ref()
-            .is_some_and(|s| *s != event.session_id)
-        {
-            return None;
-        }
         let data = serde_json::to_string(&*event).ok()?;
         Some(Ok(SseEvent::default()
             .id(event.id.clone())

@@ -15,8 +15,8 @@ use crate::message::Event;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
@@ -82,10 +82,12 @@ pub struct Webhook {
     pub secret: crate::config::Secret,
 }
 
+type EventStreams = HashMap<Option<String>, broadcast::Sender<Arc<Event>>>;
+
 pub struct Delivery {
     webhook: Option<Webhook>,
     http: reqwest::Client,
-    stream: Option<broadcast::Sender<Arc<Event>>>,
+    streams: Option<StdMutex<EventStreams>>,
     waiting: Mutex<HashMap<String, HashMap<u64, oneshot::Sender<()>>>>,
     next_waiter: AtomicU64,
     ack_timeout: Duration,
@@ -101,7 +103,7 @@ impl Delivery {
         Self {
             webhook,
             http,
-            stream: sse.then(|| broadcast::channel(STREAM_BUFFER).0),
+            streams: sse.then(|| StdMutex::new(HashMap::new())),
             waiting: Mutex::new(HashMap::new()),
             next_waiter: AtomicU64::new(1),
             ack_timeout,
@@ -110,7 +112,26 @@ impl Delivery {
 
     /// A new event-stream subscriber, if the stream is enabled.
     pub fn subscribe(&self) -> Option<broadcast::Receiver<Arc<Event>>> {
-        self.stream.as_ref().map(broadcast::Sender::subscribe)
+        self.subscribe_for(None)
+    }
+
+    /// Subscribe to one session, or all sessions when the filter is absent.
+    pub fn subscribe_for(
+        &self,
+        session_id: Option<String>,
+    ) -> Option<broadcast::Receiver<Arc<Event>>> {
+        let mut streams = self
+            .streams
+            .as_ref()?
+            .lock()
+            .expect("stream registry poisoned");
+        streams.retain(|_, stream| stream.receiver_count() > 0);
+        Some(
+            streams
+                .entry(session_id)
+                .or_insert_with(|| broadcast::channel(STREAM_BUFFER).0)
+                .subscribe(),
+        )
     }
 
     /// Record an acknowledgement from the event stream. Returns whether an
@@ -130,16 +151,25 @@ impl Delivery {
     /// Hand `event` to the application and wait for its acknowledgement.
     pub async fn deliver(&self, event: Event) -> Result<(), DeliveryError> {
         let event = Arc::new(event);
-        let listeners = self
-            .stream
+        let streams: Vec<_> = self
+            .streams
             .as_ref()
-            .map_or(0, broadcast::Sender::receiver_count);
-        if self.webhook.is_none() && listeners == 0 {
+            .map(|registry| {
+                let mut registry = registry.lock().expect("stream registry poisoned");
+                registry.retain(|_, stream| stream.receiver_count() > 0);
+                registry
+                    .iter()
+                    .filter(|(filter, _)| filter.as_ref().is_none_or(|id| *id == event.session_id))
+                    .map(|(_, stream)| stream.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self.webhook.is_none() && streams.is_empty() {
             return Err(DeliveryError::NoListener);
         }
 
         let waiter_id = self.next_waiter.fetch_add(1, Ordering::Relaxed);
-        let acked = if listeners > 0 {
+        let acked = if !streams.is_empty() {
             let (tx, rx) = oneshot::channel();
             self.waiting
                 .lock()
@@ -147,7 +177,7 @@ impl Delivery {
                 .entry(event.id.clone())
                 .or_default()
                 .insert(waiter_id, tx);
-            if let Some(stream) = &self.stream {
+            for stream in &streams {
                 let _ = stream.send(event.clone());
             }
             Some(rx)
@@ -281,6 +311,33 @@ mod tests {
         let delivery = Delivery::new(None, true, Duration::from_secs(5));
         assert_eq!(
             delivery.deliver(event("a")).await,
+            Err(DeliveryError::NoListener)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_matching_live_subscribers_count_as_listeners() {
+        let delivery = Delivery::new(None, true, Duration::from_secs(5));
+        let mut other = delivery.subscribe_for(Some("other".into())).unwrap();
+        assert_eq!(
+            delivery.deliver(event("unwatched")).await,
+            Err(DeliveryError::NoListener)
+        );
+        assert!(matches!(
+            other.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        let mut matching = delivery.subscribe_for(Some("s".into())).unwrap();
+        let send = delivery.deliver(event("matched"));
+        let ack = async {
+            let got = matching.recv().await.unwrap();
+            assert!(delivery.acknowledge(&got.id).await);
+        };
+        let (result, ()) = tokio::join!(send, ack);
+        assert_eq!(result, Ok(()));
+        drop(matching);
+        assert_eq!(
+            delivery.deliver(event("gone")).await,
             Err(DeliveryError::NoListener)
         );
     }

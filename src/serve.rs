@@ -355,7 +355,11 @@ fn event_for(
     let mut app_message = content.message.clone();
     app_message.protocol_message = Default::default();
     app_message.sender_key_distribution_message = Default::default();
-    let has_app_content = !message::encode(&app_message).is_empty();
+    // Context accompanies content; by itself it is not an application event.
+    // Clear only the probe so mixed-message output retains its context.
+    let mut content_probe = app_message.clone();
+    content_probe.message_context_info = Default::default();
+    let has_app_content = !message::encode(&content_probe).is_empty();
     let has_protocol_request =
         content
             .message

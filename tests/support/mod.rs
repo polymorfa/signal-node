@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite;
 
 pub const APP_SECRET: &str = "fixture-application-secret";
 pub const SESSION: &str = "session-fixture";
+type SendGate = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 struct State {
     connections: Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     pending: Mutex<HashMap<u64, PendingReply>>,
@@ -31,6 +32,8 @@ struct State {
     next: AtomicU64,
     sends: Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
     bundles: Mutex<HashMap<String, proto::Bundle>>,
+    send_reply: AtomicU8,
+    send_gate: Mutex<Option<SendGate>>,
 }
 enum PendingReply {
     Frame(oneshot::Sender<proto::Frame>),
@@ -100,6 +103,8 @@ impl Hub {
             next: AtomicU64::new(10000),
             sends: Mutex::new(vec![]),
             bundles: Mutex::new(HashMap::new()),
+            send_reply: AtomicU8::new(0),
+            send_gate: Mutex::new(None),
         });
         let shared = state.clone();
         let task = tokio::spawn(async move {
@@ -109,9 +114,27 @@ impl Hub {
                 };
                 let state = shared.clone();
                 tokio::spawn(async move {
-                    let socket = tokio_tungstenite::accept_hdr_async(socket, ContractHandshake)
-                        .await
-                        .unwrap();
+                    let socket = match tokio_tungstenite::accept_hdr_async(
+                        socket,
+                        ContractHandshake,
+                    )
+                    .await
+                    {
+                        Ok(socket) => socket,
+                        // Crash/reconnect scenarios may close before the
+                        // handshake completes. Keep contract failures visible.
+                        Err(tungstenite::Error::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) =>
+                        {
+                            return;
+                        }
+                        Err(error) => panic!("fixture handshake failed: {error}"),
+                    };
                     let (mut sink, mut stream) = socket.split();
                     let first = stream.next().await.unwrap().unwrap();
                     let first = proto::Frame::decode(first.into_data()).unwrap();
@@ -175,13 +198,26 @@ impl Hub {
                                             }
                                             service_request::Op::ResolveDevices(_) => runner_response::Result::Devices(proto::Devices { jids: state.bundles.lock().await.keys().cloned().collect() }),
                                             service_request::Op::FetchPreKeys(query) => runner_response::Result::Bundles(proto::Bundles { bundles: state.bundles.lock().await.iter().filter(|(jid, _)| query.jids.contains(jid)).map(|(jid, bundle)| (jid.clone(), bundle.clone())).collect() }),
+                                            service_request::Op::ResolveGroup(_) => runner_response::Result::GroupRouting(proto::GroupRouting {
+                                                participants: vec!["111@s.whatsapp.net".into(), "222@s.whatsapp.net".into()],
+                                                addressing_mode: "pn".into(),
+                                                lid_to_pn: HashMap::new(),
+                                            }),
                                             service_request::Op::SendStanza(stanza) => {
                                                 assert!(!stanza.node.windows(b"application-private-text".len()).any(|b| b == b"application-private-text"));
                                                 state.sends.lock().await.push((tokio::time::Instant::now(), stanza.node));
+                                                if let Some((observed, release)) = state.send_gate.lock().await.take() {
+                                                    observed.notify_one();
+                                                    release.notified().await;
+                                                }
+                                                match state.send_reply.load(Ordering::SeqCst) {
+                                                    1 => continue, // Accepted, but its reply is lost.
+                                                    2 => break, // Link lost after accepting the stanza.
+                                                    _ => {}
+                                                }
                                                 runner_response::Result::Send(proto::SendResult { server_timestamp: 1720000000, participant_hash_mismatch: false })
                                             }
                                             service_request::Op::Ping(_) | service_request::Op::ReleaseSession(_) => runner_response::Result::Ok(proto::Ok {}),
-                                            _ => panic!("Unexpected fixture lookup"),
                                         };
                                         let body = match failure { Some(error) => Body::Error(error), None => Body::RunnerResponse(proto::RunnerResponse { result: Some(result) }) };
                                         tx.send(proto::Frame::with(frame.id, body).encode_to_vec()).unwrap();
@@ -296,6 +332,17 @@ impl Hub {
     }
     pub async fn sends(&self) -> Vec<(tokio::time::Instant, Vec<u8>)> {
         self.state.sends.lock().await.clone()
+    }
+    pub fn lose_send_reply(&self, disconnect: bool) {
+        self.state
+            .send_reply
+            .store(if disconnect { 2 } else { 1 }, Ordering::SeqCst);
+    }
+    pub async fn gate_next_send(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.state.send_gate.lock().await = Some((observed.clone(), release.clone()));
+        (observed, release)
     }
 }
 impl Drop for Hub {

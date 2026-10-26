@@ -30,6 +30,8 @@ jobs:
       SIGNAL_NODE_TEST_POSTGRES_URL: postgres://signal_node_tests@127.0.0.1:5432/signal_node_tests
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -47,5 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: docker build --tag signal-node:ci .
       - run: docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges signal-node:ci --version

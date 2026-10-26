@@ -104,7 +104,17 @@
             "description": "Runner send ceiling reached"
           },
           "503": {
-            "description": "Relay disconnected or unavailable"
+            "description": "Relay disconnected before queueing the send, or storage/runner unavailable"
+          },
+          "504": {
+            "description": "Send outcome is unconfirmed after queueing. Retain error.message_id for reconciliation; do not automatically retry, because a new request creates another message ID. This ID is not an idempotency key or a lookup endpoint.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnconfirmedSend"
+                }
+              }
+            }
           },
           "401": {
             "description": "Missing or invalid application secret"
@@ -448,6 +458,23 @@
             }
           }
         ]
+      },
+      "UnconfirmedSend": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message", "message_id"],
+            "properties": {
+              "code": { "type": "string", "const": "send_unconfirmed" },
+              "message": { "type": "string" },
+              "message_id": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
       },
       "SendOutcome": {
         "type": "object",

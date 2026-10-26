@@ -156,6 +156,49 @@ async fn app_auth_origin_and_public_liveness_keep_private_state_hidden() {
     assert!(!sessions.to_string().contains("master_key"));
     running.shutdown().await;
 }
+
+#[tokio::test]
+async fn an_unrelated_sse_filter_does_not_make_a_session_wait_for_an_ack() {
+    let hub = Hub::start().await;
+    let running = start(
+        &hub,
+        "node-filter",
+        Backend::Memory(Arc::new(MemoryRecordStore::new())),
+        false,
+    )
+    .await;
+    let generation = running.node.session(SESSION).unwrap().generation;
+    let receive = encrypted(
+        &hub,
+        "node-filter",
+        &running,
+        wa::Message {
+            conversation: Some("unwatched fixture".into()),
+            ..Default::default()
+        },
+        false,
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{}/v1/events?session_id=other",
+            running.http_addr
+        ))
+        .bearer_auth(APP_SECRET)
+        .send()
+        .await
+        .unwrap();
+    let result = hub
+        .command("node-filter", generation, Op::Receive(receive))
+        .await;
+    let Some(Body::Error(error)) = result.body else {
+        panic!("unwatched receive was acknowledged");
+    };
+    assert_eq!(error.code_enum(), proto::Code::Unavailable);
+    assert!(error.message.starts_with("no application is listening"));
+    drop(response);
+    running.shutdown().await;
+}
 #[tokio::test]
 async fn real_encrypted_receive_requires_app_ack_then_is_durable_and_sealed() {
     let hub = Hub::start().await;
@@ -380,6 +423,11 @@ async fn app_state_keys_require_separate_consent_and_an_own_device() {
                     ..Default::default()
                 }
                 .into(),
+                message_context_info: Some(wa::MessageContextInfo {
+                    message_secret: Some(vec![9; 32]),
+                    ..Default::default()
+                })
+                .into(),
                 ..Default::default()
             },
             from_me,
@@ -589,6 +637,126 @@ async fn http_send_stanza_round_trips_into_the_other_device_and_never_exceeds_fi
         Some("application-private-text")
     );
     running.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lost_send_reply_reports_the_original_unconfirmed_message_without_retrying() {
+    for disconnect in [false, true] {
+        let hub = Hub::start().await;
+        let running = start(
+            &hub,
+            "node-uncertain",
+            Backend::Memory(Arc::new(MemoryRecordStore::new())),
+            false,
+        )
+        .await;
+        let generation = running.node.session(SESSION).unwrap().generation;
+        identity(&hub, "node-uncertain", generation).await;
+        let ops = running.node.session(SESSION).unwrap().ops().unwrap();
+        pair(&*ops).await;
+        ops.set_own_jids("222:1@s.whatsapp.net", Some("22201:1@lid"))
+            .await
+            .unwrap();
+        let (_peer, bundle) = peer("uncertain-peer").await;
+        hub.bundle("111:1@s.whatsapp.net", bundle).await;
+        hub.lose_send_reply(disconnect);
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{}/v1/sessions/{SESSION}/messages",
+                running.http_addr
+            ))
+            .bearer_auth(APP_SECRET)
+            .json(&serde_json::json!({"to":"111@s.whatsapp.net","text":"application-private-text"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 504, "disconnect={disconnect}");
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(body["error"]["code"], "send_unconfirmed");
+        let sends = hub.sends().await;
+        assert_eq!(sends.len(), 1, "an uncertain send must not be repeated");
+        let stanza = wacore_binary::marshal::unmarshal_packed_ref(&sends[0].1)
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            body["error"]["message_id"].as_str().unwrap(),
+            stanza.attrs.get("id").unwrap().as_str()
+        );
+        running.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_loss() {
+    use signal_node::store::SqliteStore;
+    for fence_lost in [false, true] {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-state");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("send-{}.sqlite", rand::random::<u64>()));
+        let url = format!("sqlite://{}", path.display());
+        let backend = SqliteStore::connect(&url, 2).await.unwrap();
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        let hub = Hub::start().await;
+        let running = start(&hub, "node-mark-failure", Backend::Sqlite(backend), false).await;
+        let session = running.node.session(SESSION).unwrap();
+        identity(&hub, "node-mark-failure", session.generation).await;
+        let ops = session.ops().unwrap();
+        pair(&*ops).await;
+        ops.set_own_jids("222:1@s.whatsapp.net", Some("22201:1@lid"))
+            .await
+            .unwrap();
+        let (_peer, bundle) = peer("mark-failure-peer").await;
+        hub.bundle("111:1@s.whatsapp.net", bundle).await;
+        if !fence_lost {
+            sqlx::query("CREATE TRIGGER fail_distribution BEFORE INSERT ON signal_records WHEN NEW.ns = 'sender_key_devices' BEGIN SELECT RAISE(ABORT, 'synthetic distribution write failure'); END")
+                .execute(&pool).await.unwrap();
+        }
+        let (observed, release) = hub.gate_next_send().await;
+        let send = reqwest::Client::new()
+            .post(format!(
+                "http://{}/v1/sessions/{SESSION}/messages",
+                running.http_addr
+            ))
+            .bearer_auth(APP_SECRET)
+            .json(&serde_json::json!({"to":"12345@g.us","text":"application-private-text"}))
+            .send();
+        let change = async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), observed.notified())
+                .await
+                .expect("send never reached the runner");
+            if fence_lost {
+                sqlx::query("UPDATE signal_leases SET generation = generation + 1 WHERE scope = ?")
+                    .bind(SESSION)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            release.notify_one();
+        };
+        let (response, ()) = tokio::join!(send, change);
+        let response = response.unwrap();
+        let status = response.status();
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(
+            status, 200,
+            "fence_lost={fence_lost}, error={:?}",
+            body["error"]["code"]
+        );
+        assert!(body["message_id"].is_string());
+        assert_eq!(body["server_timestamp"], 1720000000);
+        assert_eq!(hub.sends().await.len(), 1);
+        if fence_lost {
+            assert!(
+                !session.can_serve().await,
+                "fence loss must still retire the old session"
+            );
+        }
+        drop(ops);
+        drop(session);
+        running.shutdown().await;
+        pool.close().await;
+        std::fs::remove_file(&path).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -923,6 +1091,11 @@ async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_hi
             wa::Message {
                 conversation: Some("mixed-user-content".into()),
                 protocol_message: Some(protocol).into(),
+                message_context_info: Some(wa::MessageContextInfo {
+                    message_secret: Some(vec![9; 32]),
+                    ..Default::default()
+                })
+                .into(),
                 ..Default::default()
             },
             from_me,
@@ -951,6 +1124,14 @@ async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_hi
             )
             .unwrap();
             assert!(!message.protocol_message.is_set());
+            assert_eq!(
+                message
+                    .message_context_info
+                    .as_option()
+                    .unwrap()
+                    .message_secret,
+                Some(vec![9; 32])
+            );
             assert_eq!(
                 client
                     .post(format!(

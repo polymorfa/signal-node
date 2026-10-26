@@ -335,6 +335,7 @@ async fn consume_pending(
             .unwrap();
         file.sync_all().unwrap();
         std::fs::File::open(&dir).unwrap().sync_all().unwrap();
+        drop(file);
         assert_eq!(
             client
                 .post(format!(
@@ -348,6 +349,7 @@ async fn consume_pending(
                 .status(),
             204
         );
+        std::fs::remove_dir_all(&dir).unwrap();
     };
     let (received, ()) = tokio::join!(delivery, app);
     assert!(matches!(

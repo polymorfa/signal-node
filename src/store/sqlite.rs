@@ -12,7 +12,8 @@ use super::{LeaseDecision, db_error, decide, empty_holder, prefix_end, to_i64, t
 use async_trait::async_trait;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
-use sqlx::{Row, Sqlite};
+use sqlx::{Row, Sqlite, SqliteConnection};
+use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,39 @@ pub struct SqliteStore {
     pool: SqlitePool,
 }
 
-type Conn = PoolConnection<Sqlite>;
+/// Own the connection before BEGIN is queued. Cancellation at any await,
+/// including BEGIN/COMMIT/ROLLBACK, closes rather than pools an uncertain
+/// connection. SQLite rolls back an open transaction when it closes.
+struct Conn(Option<PoolConnection<Sqlite>>);
+
+impl Conn {
+    fn recycle(&mut self) {
+        // Only a confirmed COMMIT or ROLLBACK may return it to the pool.
+        drop(self.0.take());
+    }
+}
+
+impl Deref for Conn {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("transaction connection is owned")
+    }
+}
+
+impl DerefMut for Conn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("transaction connection is owned")
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            drop(conn.detach());
+        }
+    }
+}
 
 impl SqliteStore {
     /// `url` is `sqlite://path/to/file.db` (created if missing) or
@@ -58,7 +91,9 @@ impl SqliteStore {
     }
 
     async fn begin_immediate(&self, op: &'static str) -> Result<Conn> {
-        let mut conn = self.pool.acquire().await.map_err(|e| db_error(op, e))?;
+        let mut conn = Conn(Some(
+            self.pool.acquire().await.map_err(|e| db_error(op, e))?,
+        ));
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *conn)
             .await
@@ -71,16 +106,18 @@ impl SqliteStore {
     async fn finish<T>(mut conn: Conn, result: Result<T>) -> Result<T> {
         match result {
             Ok(value) => {
-                if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    return Err(db_error("commit", e));
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                    if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok() {
+                        conn.recycle();
+                    }
+                    return Err(db_error("commit", error));
                 }
+                conn.recycle();
                 Ok(value)
             }
             Err(error) => {
-                if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
-                    // Do not reuse a connection in an unknown state.
-                    conn.detach();
+                if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok() {
+                    conn.recycle();
                 }
                 Err(error)
             }
@@ -309,5 +346,112 @@ impl LeaseStore for SqliteStore {
         .await
         .map_err(|e| db_error("release", e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_commit_rolls_back_before_the_pool_is_reused() {
+        let store = SqliteStore::connect("sqlite::memory:", 1).await.unwrap();
+        sqlx::query("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+            .execute(&store.pool).await.unwrap();
+        let mut conn = store.begin_immediate("commit fixture").await.unwrap();
+        sqlx::query("INSERT INTO child VALUES (7)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(SqliteStore::finish(conn, Ok(())).await.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM child")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            store
+                .acquire("scope", "holder", 0, 1000)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_transaction_rolls_back_and_releases_the_writer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-state");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("cancel-{}.sqlite", rand::random::<u64>()));
+        let url = format!("sqlite://{}", path.display());
+        let store = SqliteStore::connect(&url, 1).await.unwrap();
+        let other = SqliteStore::connect(&url, 1).await.unwrap();
+        let lease = store
+            .acquire("scope", "holder", 0, 1000)
+            .await
+            .unwrap()
+            .unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let worker = {
+            let store = store.clone();
+            let fence = lease.fence.clone();
+            tokio::spawn(async move {
+                let mut conn = store.begin_immediate("cancel fixture").await.unwrap();
+                SqliteStore::write_in(
+                    &mut conn,
+                    &fence,
+                    &[WriteOp::Put {
+                        ns: Namespace::Device,
+                        key: "uncommitted".into(),
+                        value: b"must roll back".to_vec(),
+                    }],
+                )
+                .await
+                .unwrap();
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(conn);
+            })
+        };
+        started.await.unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        // Use the original one-connection pool first: an abandoned raw
+        // transaction would expose its uncommitted row here.
+        assert_eq!(
+            store
+                .get("scope", Namespace::Device, "uncommitted")
+                .await
+                .unwrap(),
+            None
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            other.write(
+                &lease.fence,
+                &[WriteOp::Put {
+                    ns: Namespace::Device,
+                    key: "committed".into(),
+                    value: b"new writer".to_vec(),
+                }],
+            ),
+        )
+        .await
+        .expect("cancelled transaction retained the write lock")
+        .unwrap();
+        assert_eq!(
+            store
+                .get("scope", Namespace::Device, "committed")
+                .await
+                .unwrap(),
+            Some(b"new writer".to_vec())
+        );
+        store.pool.close().await;
+        other.pool.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 }

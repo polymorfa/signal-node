@@ -47,6 +47,8 @@ pub enum LinkError {
     Disconnected,
     #[error("Polymorfa did not answer in time")]
     Timeout,
+    #[error("the connection closed before Polymorfa answered the queued request")]
+    ResponseLost,
     #[error("Polymorfa refused the request: {0}")]
     Remote(proto::Error),
     #[error("Polymorfa sent an unexpected response")]
@@ -124,7 +126,7 @@ impl Link {
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(LinkError::Remote(error)),
-            Ok(Err(_)) => Err(LinkError::Disconnected),
+            Ok(Err(_)) => Err(LinkError::ResponseLost),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err(LinkError::Timeout)
