@@ -153,7 +153,9 @@ impl Link {
 pub trait Handler: Send + Sync + 'static {
     async fn runner_request(&self, request: RunnerRequest)
     -> Result<ServiceResponse, proto::Error>;
-    async fn session_event(&self, event: SessionEvent);
+    /// `origin` is the link that delivered the event; a handler must ignore
+    /// events from a link that is no longer current.
+    async fn session_event(&self, event: SessionEvent, origin: Arc<Link>);
     /// A link finished its handshake. Claims go out from here.
     async fn connected(&self, link: Arc<Link>);
     async fn disconnected(&self);
@@ -420,7 +422,8 @@ async fn dispatch(link: &Arc<Link>, handler: &Arc<dyn Handler>, frame: Frame) {
         }
         Some(Body::SessionEvent(event)) => {
             let handler = handler.clone();
-            tokio::spawn(async move { handler.session_event(event).await });
+            let origin = link.clone();
+            tokio::spawn(async move { handler.session_event(event, origin).await });
         }
         Some(Body::Welcome(_)) => {}
         Some(Body::Hello(_) | Body::ServiceRequest(_) | Body::ServiceResponse(_)) => {

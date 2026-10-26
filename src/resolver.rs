@@ -149,7 +149,8 @@ impl SendContextResolver for RemoteResolver {
         };
         let mode = match routing.addressing_mode.as_str() {
             "lid" => AddressingMode::Lid,
-            "pn" | "" => AddressingMode::Pn,
+            "pn" => AddressingMode::Pn,
+            // The contract allows only pn or lid; never guess the address family.
             _ => anyhow::bail!("Polymorfa returned an unknown addressing mode"),
         };
         let participants = parse_jids(&routing.participants)?;

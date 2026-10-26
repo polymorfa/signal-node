@@ -142,6 +142,10 @@ pub struct Node {
     sessions: RwLock<HashMap<String, Arc<ActiveSession>>>,
     /// Sessions Polymorfa reported logged out; not taken again until restart.
     retired: RwLock<HashSet<String>>,
+    /// Highest generation this process stopped serving without a confirmed
+    /// release. A reacquired lease at or below it shares the old fence, so it is
+    /// released again instead of served.
+    abandoned: RwLock<HashMap<String, u64>>,
     link: RwLock<Option<Arc<Link>>>,
     pub delivery: Delivery,
     shutdown: watch::Sender<bool>,
@@ -166,6 +170,7 @@ impl Node {
             backend: Arc::new(backend),
             sessions: RwLock::new(HashMap::new()),
             retired: RwLock::new(HashSet::new()),
+            abandoned: RwLock::new(HashMap::new()),
             link: RwLock::new(None),
             delivery,
             shutdown: watch::channel(false).0,
@@ -343,9 +348,7 @@ impl Node {
                     let now = now_ms();
                     if now >= lease.expires_at_ms {
                         self.lose(id, session.generation, "lease expired before renewal");
-                        // Releasing our still-current expired lease ensures a subsequent
-                        // reacquisition increments the generation, even with this holder ID.
-                        let _ = self.backend.release(&lease).await;
+                        self.abandon(id, &lease).await;
                         continue;
                     }
                     match self.backend.renew(&lease, now, ttl).await {
@@ -364,6 +367,7 @@ impl Node {
                                     session.generation,
                                     "lease could not be renewed before it expired",
                                 );
+                                self.abandon(id, &lease).await;
                                 continue;
                             }
                         }
@@ -373,6 +377,10 @@ impl Node {
                     }
                 }
                 None => {
+                    // A partitioned replica must leave free leases for a healthy one.
+                    if self.link().is_none() {
+                        continue;
+                    }
                     let acquired = self
                         .backend
                         .acquire(id, &self.lease_holder, now_ms(), ttl)
@@ -380,6 +388,20 @@ impl Node {
                     match acquired {
                         Ok(Some(lease)) => {
                             let generation = lease.fence.generation;
+                            let stale = self
+                                .abandoned
+                                .read()
+                                .expect("abandoned lock")
+                                .get(id)
+                                .is_some_and(|g| generation <= *g);
+                            if stale {
+                                // Same holder, same fence: release so the next
+                                // acquisition increments the generation.
+                                if self.backend.release(&lease).await.is_ok() {
+                                    tracing::info!(session = %id, generation, "released an abandoned fence before reacquiring");
+                                }
+                                continue;
+                            }
                             match self.activate(lease.clone()).await {
                                 Ok(session) => {
                                     if *self.shutdown.borrow() {
@@ -404,6 +426,21 @@ impl Node {
                     }
                 }
             }
+        }
+    }
+
+    /// Stop owning `lease` after serving stopped without a renewal. Release it so
+    /// the next acquisition increments the generation; remember the generation in
+    /// case the release fails, so this process never serves that fence again.
+    async fn abandon(&self, id: &str, lease: &Lease) {
+        let generation = lease.fence.generation;
+        {
+            let mut abandoned = self.abandoned.write().expect("abandoned lock");
+            let entry = abandoned.entry(id.to_owned()).or_insert(generation);
+            *entry = (*entry).max(generation);
+        }
+        if let Err(e) = self.backend.release(lease).await {
+            tracing::warn!(session = id, generation, error = %e, "abandoned lease release failed; its fence stays refused");
         }
     }
 
@@ -600,7 +637,16 @@ impl Handler for Node {
         crate::serve::handle(self, &session, op).await
     }
 
-    async fn session_event(&self, event: SessionEvent) {
+    async fn session_event(&self, event: SessionEvent, origin: Arc<Link>) {
+        // Events carry no generation. One from a replaced link describes the
+        // old connection and must not retire or reclaim its successor.
+        if !self
+            .link()
+            .is_some_and(|current| Arc::ptr_eq(&current, &origin))
+        {
+            tracing::debug!(session = %event.session_id, "ignored a session event from a previous link");
+            return;
+        }
         let Some(session) = self.session(&event.session_id) else {
             return;
         };

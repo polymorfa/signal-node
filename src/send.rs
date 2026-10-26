@@ -49,6 +49,8 @@ pub enum SendError {
     Refused(proto::Error),
     #[error("send ceiling reached")]
     RateLimited,
+    #[error("session storage is unavailable")]
+    StorageUnavailable,
     #[error("building the stanza failed")]
     Build,
 }
@@ -81,6 +83,8 @@ fn ops_failure(node: &Node, session: &ActiveSession, error: &OpsError) -> SendEr
             SendError::NotPaired
         }
         OpsError::InvalidInput(m) => SendError::Invalid(m.clone()),
+        // A storage outage is retryable; it is not a stanza construction failure.
+        OpsError::Store(_) => SendError::StorageUnavailable,
         _ => SendError::Build,
     }
 }

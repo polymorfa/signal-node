@@ -142,6 +142,9 @@ async fn send_message(
                     }
                     _ => (StatusCode::BAD_GATEWAY, "send_failed"),
                 },
+                SendError::StorageUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+                }
                 SendError::Build => (StatusCode::BAD_GATEWAY, "send_failed"),
             };
             error(status, code, e.to_string())

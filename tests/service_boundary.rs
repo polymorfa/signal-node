@@ -779,23 +779,39 @@ async fn expired_holder_refuses_requests_and_old_callbacks_preserve_new_generati
 
 #[tokio::test]
 async fn process_incarnations_with_the_same_node_id_cannot_share_a_fence() {
+    // Both processes hold live links: a node without one takes no leases.
+    let hub = Hub::start().await;
     let records = Arc::new(MemoryRecordStore::new());
-    let cfg = config("same-stable-node", "ws://127.0.0.1:1/signal", false);
-    let first = signal_node::node::Node::new(cfg.clone(), Backend::Memory(records.clone()));
-    let replacement = signal_node::node::Node::new(cfg, Backend::Memory(records));
-    first.tick_leases().await;
-    let old = first.session(SESSION).unwrap();
+    let first = start(
+        &hub,
+        "same-stable-node",
+        Backend::Memory(records.clone()),
+        false,
+    )
+    .await;
+    let old = first.node.session(SESSION).unwrap();
     let ops = old.ops_or_create().await.unwrap();
-    replacement.tick_leases().await;
+    let replacement = signal_node::start(
+        config("same-stable-node", &hub.url, false),
+        Backend::Memory(records),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert!(
-        replacement.session(SESSION).is_none(),
+        replacement.node.session(SESSION).is_none(),
         "an active lease cannot be reacquired by another process with the same node ID"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
-    replacement.tick_leases().await;
-    assert!(replacement.session(SESSION).unwrap().generation > old.generation);
+    first.abort();
+    wait(|| {
+        replacement
+            .node
+            .session(SESSION)
+            .is_some_and(|s| s.generation > old.generation)
+    })
+    .await;
     assert!(ops.generate_prekeys(1).await.unwrap_err().is_fence_lost());
-    first.shutdown().await;
+    first.node.shutdown().await;
     replacement.shutdown().await;
 }
 
@@ -979,4 +995,16 @@ async fn reconnect_claims_a_strictly_higher_durable_generation() {
     .await;
     assert!(running.node.session(SESSION).unwrap().generation > first);
     running.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_node_without_a_live_link_takes_no_leases() {
+    // A partitioned replica must leave free sessions to a connected one.
+    let node = signal_node::node::Node::new(
+        config("partitioned", "ws://127.0.0.1:1/signal", false),
+        Backend::Memory(Arc::new(MemoryRecordStore::new())),
+    );
+    node.tick_leases().await;
+    assert!(node.session(SESSION).is_none());
+    node.shutdown().await;
 }

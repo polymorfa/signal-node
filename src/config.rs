@@ -429,6 +429,13 @@ impl Config {
         if credential.is_empty() {
             return Err(invalid("polymorfa.credential is required"));
         }
+        // Fail at startup, not on every handshake: the credential travels as
+        // `Authorization: Bearer <credential>`.
+        if !credential.expose().bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(invalid(
+                "polymorfa.credential must be printable ASCII without spaces",
+            ));
+        }
         let relay = reqwest::Url::parse(&self.polymorfa.url)
             .map_err(|_| invalid("polymorfa.url is invalid"))?;
         let local = matches!(relay.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -636,6 +643,18 @@ mod tests {
         );
         assert!(resolved.sse);
         assert_eq!(resolved.master_key, [0; 32]);
+    }
+
+    #[test]
+    fn a_credential_that_cannot_form_a_header_is_rejected_at_startup() {
+        for bad in ["pk_test\ncredential", "pk test", "pk_tést"] {
+            let mut config = Config::from_toml(MINIMAL).unwrap();
+            config
+                .apply_env(|name| (name == "SIGNAL_NODE_POLYMORFA_CREDENTIAL").then(|| bad.into()))
+                .unwrap();
+            let err = config.resolve().unwrap_err().to_string();
+            assert!(err.contains("polymorfa.credential"), "{bad:?}: {err}");
+        }
     }
 
     #[test]
