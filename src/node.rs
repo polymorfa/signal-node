@@ -429,6 +429,16 @@ impl Node {
         }
     }
 
+    /// Polymorfa refused this session's generation, for example after a
+    /// runner-side pause. Stop serving it and release the durable lease, so the
+    /// next acquisition claims a strictly higher generation instead of
+    /// retrying the refused one forever.
+    pub(crate) async fn refused_generation(&self, session: &ActiveSession, why: &str) {
+        let lease = session.lease().await;
+        self.lose(&session.id, session.generation, why);
+        self.abandon(&session.id, &lease).await;
+    }
+
     /// Stop owning `lease` after serving stopped without a renewal. Release it so
     /// the next acquisition increments the generation; remember the generation in
     /// case the release fails, so this process never serves that fence again.
@@ -495,11 +505,8 @@ impl Node {
             Ok(_) => tracing::warn!(session = %session.id, "unexpected answer to ClaimSession"),
             Err(LinkError::Remote(error)) => match error.code_enum() {
                 Code::NotLeaseHolder => {
-                    self.lose(
-                        &session.id,
-                        session.generation,
-                        "Polymorfa accepted a newer claim",
-                    );
+                    self.refused_generation(session, "Polymorfa refused this claim generation")
+                        .await;
                 }
                 Code::SessionUnavailable => tracing::warn!(
                     session = %session.id,

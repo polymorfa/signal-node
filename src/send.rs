@@ -162,11 +162,11 @@ pub async fn send(
                 return Err(match error.code_enum() {
                     Code::RateLimited => SendError::RateLimited,
                     Code::NotLeaseHolder => {
-                        node.lose(
-                            &session.id,
-                            session.generation,
+                        node.refused_generation(
+                            session,
                             "Polymorfa refused a send at this generation",
-                        );
+                        )
+                        .await;
                         SendError::NotLeaseHolder
                     }
                     _ => SendError::Refused(error),
