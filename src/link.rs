@@ -161,12 +161,19 @@ pub trait Handler: Send + Sync + 'static {
 
 #[derive(Debug, thiserror::Error)]
 enum ConnectError {
+    // Boxed: tungstenite::Error is large and this travels on every Result.
     #[error("WebSocket: {0}")]
-    WebSocket(#[from] tungstenite::Error),
+    WebSocket(Box<tungstenite::Error>),
     #[error("handshake: {0}")]
     Handshake(String),
     #[error("Polymorfa refused the connection: {0}")]
     Refused(proto::Error),
+}
+
+impl From<tungstenite::Error> for ConnectError {
+    fn from(err: tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(err))
+    }
 }
 
 /// Keep a link to Polymorfa until `shutdown` turns true.
@@ -351,7 +358,7 @@ async fn connect_and_serve(
             message = stream.next() => {
                 let message = match message {
                     Some(Ok(m)) => m,
-                    Some(Err(e)) => break Err(ConnectError::WebSocket(e)),
+                    Some(Err(e)) => break Err(ConnectError::from(e)),
                     None => break Ok(()),
                 };
                 match message {

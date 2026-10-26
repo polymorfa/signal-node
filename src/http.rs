@@ -154,6 +154,8 @@ struct EventFilter {
     session_id: Option<String>,
 }
 
+// An error Response is the standard axum handler shape; it is built only on refusal.
+#[allow(clippy::result_large_err)]
 async fn events(
     State(node): State<Arc<Node>>,
     Query(filter): Query<EventFilter>,
