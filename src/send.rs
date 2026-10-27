@@ -108,100 +108,122 @@ pub async fn send(
         wacore::request::RequestUtils::message_id_at(own.as_ref(), u64::try_from(now).unwrap_or(0));
 
     let mut resent = false;
-    loop {
-        let link = node.link().ok_or(SendError::Disconnected)?;
-        if !session.can_serve().await || !session.is_claimed() {
-            return Err(SendError::NotLeaseHolder);
-        }
-        let resolver = RemoteResolver {
-            link: link.clone(),
-            session_id: session.id.clone(),
-            generation: session.generation,
-        };
-        let built = if to.is_group() {
-            let prepared = ops
-                .send_group(&TokioRuntime, &resolver, &to, &message, &message_id)
-                .await
-                .map_err(|e| ops_failure(node, session, &e))?;
-            Built::Group {
-                stanza: prepared.stanza,
-                phash: prepared.phash,
-                targets: prepared.distribution_targets,
+    let outcome = async {
+        loop {
+            let link = node.link().ok_or(SendError::Disconnected)?;
+            if !session.can_serve().await || !session.is_claimed() {
+                return Err(SendError::NotLeaseHolder);
             }
-        } else {
-            let prepared = ops
-                .send_direct(&TokioRuntime, &resolver, &to, &message, &message_id)
-                .await
-                .map_err(|e| ops_failure(node, session, &e))?;
-            Built::Direct {
-                stanza: prepared.stanza,
-                phash: prepared.phash,
-            }
-        };
-        let (stanza, phash) = match &built {
-            Built::Direct { stanza, phash } | Built::Group { stanza, phash, .. } => {
-                (stanza.clone(), phash.clone().unwrap_or_default())
-            }
-        };
+            let resolver = RemoteResolver {
+                link: link.clone(),
+                session_id: session.id.clone(),
+                generation: session.generation,
+            };
+            let built = if to.is_group() {
+                let prepared = ops
+                    .send_group(&TokioRuntime, &resolver, &to, &message, &message_id)
+                    .await
+                    .map_err(|e| ops_failure(node, session, &e))?;
+                Built::Group {
+                    stanza: prepared.stanza,
+                    phash: prepared.phash,
+                    targets: prepared.distribution_targets,
+                }
+            } else {
+                let prepared = ops
+                    .send_direct(&TokioRuntime, &resolver, &to, &message, &message_id)
+                    .await
+                    .map_err(|e| ops_failure(node, session, &e))?;
+                Built::Direct {
+                    stanza: prepared.stanza,
+                    phash: prepared.phash,
+                }
+            };
+            let (stanza, phash) = match &built {
+                Built::Direct { stanza, phash } | Built::Group { stanza, phash, .. } => {
+                    (stanza.clone(), phash.clone().unwrap_or_default())
+                }
+            };
 
-        session.limiter.acquire(link.max_sends_per_second()).await;
-        if !session.can_serve().await || !session.is_claimed() {
-            return Err(SendError::NotLeaseHolder);
-        }
-        let op = service_request::Op::SendStanza(SendStanza {
-            node: stanza,
-            phash,
-        });
-        let result = match link.request(&session.id, session.generation, op).await {
-            Ok(runner_response::Result::Send(result)) => result,
-            Ok(_) => return Err(SendError::Unconfirmed { message_id }),
-            Err(LinkError::Remote(error)) => {
-                return Err(match error.code_enum() {
-                    Code::RateLimited => SendError::RateLimited,
-                    Code::NotLeaseHolder => {
-                        node.refused_generation(
-                            session,
-                            "Polymorfa refused a send at this generation",
-                        )
-                        .await;
-                        SendError::NotLeaseHolder
-                    }
-                    _ => SendError::Refused(error),
-                });
+            session.limiter.acquire(link.max_sends_per_second()).await;
+            if !session.can_serve().await || !session.is_claimed() {
+                return Err(SendError::NotLeaseHolder);
             }
-            Err(LinkError::Disconnected) => return Err(SendError::Disconnected),
-            Err(LinkError::Timeout | LinkError::ResponseLost | LinkError::UnexpectedResponse) => {
-                return Err(SendError::Unconfirmed { message_id });
-            }
-        };
+            let op = service_request::Op::SendStanza(SendStanza {
+                node: stanza,
+                phash,
+            });
+            let result = match link.request(&session.id, session.generation, op).await {
+                Ok(runner_response::Result::Send(result)) => result,
+                Ok(_) => {
+                    return Err(SendError::Unconfirmed {
+                        message_id: message_id.clone(),
+                    });
+                }
+                Err(LinkError::Remote(error)) => {
+                    return Err(match error.code_enum() {
+                        Code::RateLimited => SendError::RateLimited,
+                        Code::NotLeaseHolder => {
+                            node.refused_generation(
+                                session,
+                                "Polymorfa refused a send at this generation",
+                            )
+                            .await;
+                            SendError::NotLeaseHolder
+                        }
+                        _ => SendError::Refused(error),
+                    });
+                }
+                Err(LinkError::Disconnected) => return Err(SendError::Disconnected),
+                Err(LinkError::Timeout | LinkError::ResponseLost | LinkError::UnexpectedResponse) => {
+                    return Err(SendError::Unconfirmed {
+                        message_id: message_id.clone(),
+                    });
+                }
+            };
 
-        // WA Web marks the sender key as held once the server acks, before
-        // it looks at the participant hash (WAWebSendGroupSkmsgJob.js:199).
-        if let Built::Group { targets, .. } = &built
-            && !targets.is_empty()
-            && let Err(e) = ops.mark_sender_key_distributed(&to, targets).await
-        {
-            // The runner has already confirmed the send. A failed local
-            // distribution mark must not invite a new message ID or resend.
-            // Fence loss still retires this session before returning success.
-            node.ops_error(session, &e);
-            tracing::warn!(session = %session.id, message_id = %message_id, "send accepted; sender-key distribution was not recorded");
+            // WA Web marks the sender key as held once the server acks, before
+            // it looks at the participant hash (WAWebSendGroupSkmsgJob.js:188-205,
+            // Cellar bundle whatsapp-1051710191).
+            if let Built::Group { targets, .. } = &built
+                && !targets.is_empty()
+                && let Err(e) = ops.mark_sender_key_distributed(&to, targets).await
+            {
+                // The runner has already confirmed the send. A failed local
+                // distribution mark must not invite a new message ID. Only fence
+                // loss stops the same-ID mismatch resend and retires this session.
+                node.ops_error(session, &e);
+                tracing::warn!(session = %session.id, message_id = %message_id, "send accepted; sender-key distribution was not recorded");
+                if e.is_fence_lost() {
+                    return Ok(SendOutcome {
+                        message_id: message_id.clone(),
+                        server_timestamp: result.server_timestamp,
+                        resent,
+                    });
+                }
+            }
+            tracing::info!(session = %session.id, message_id = %message_id, resent, "sent");
+            if result.participant_hash_mismatch && !resent {
+                tracing::info!(session = %session.id, message_id = %message_id, "device list changed; resending once");
+                resent = true;
+                continue;
+            }
             return Ok(SendOutcome {
-                message_id,
+                message_id: message_id.clone(),
                 server_timestamp: result.server_timestamp,
                 resent,
             });
         }
-        tracing::info!(session = %session.id, message_id = %message_id, resent, "sent");
-        if result.participant_hash_mismatch && !resent {
-            tracing::info!(session = %session.id, message_id = %message_id, "device list changed; resending once");
-            resent = true;
-            continue;
-        }
-        return Ok(SendOutcome {
-            message_id,
-            server_timestamp: result.server_timestamp,
-            resent,
-        });
     }
+    .await;
+    // A mismatch ACK may already represent delivery to some participants.
+    // Any later failure belongs to this message, even if the resend was never
+    // built or queued. Ordinary retryable errors would invite a fresh ID.
+    outcome.map_err(|error| {
+        if resent {
+            SendError::Unconfirmed { message_id }
+        } else {
+            error
+        }
+    })
 }

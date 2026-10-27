@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -33,6 +33,8 @@ struct State {
     sends: Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
     bundles: Mutex<HashMap<String, proto::Bundle>>,
     send_reply: AtomicU8,
+    mismatch_next_send: AtomicBool,
+    resend_failure: AtomicU8,
     send_gate: Mutex<Option<SendGate>>,
 }
 enum PendingReply {
@@ -91,6 +93,12 @@ pub struct Hub {
     state: Arc<State>,
     task: JoinHandle<()>,
 }
+#[derive(Clone, Copy, Debug)]
+pub enum ResendFailure {
+    DisconnectLookup = 1,
+    RefuseSend = 2,
+    LoseReply = 3,
+}
 impl Hub {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -104,6 +112,8 @@ impl Hub {
             sends: Mutex::new(vec![]),
             bundles: Mutex::new(HashMap::new()),
             send_reply: AtomicU8::new(0),
+            mismatch_next_send: AtomicBool::new(false),
+            resend_failure: AtomicU8::new(0),
             send_gate: Mutex::new(None),
         });
         let shared = state.clone();
@@ -198,14 +208,23 @@ impl Hub {
                                             }
                                             service_request::Op::ResolveDevices(_) => runner_response::Result::Devices(proto::Devices { jids: state.bundles.lock().await.keys().cloned().collect() }),
                                             service_request::Op::FetchPreKeys(query) => runner_response::Result::Bundles(proto::Bundles { bundles: state.bundles.lock().await.iter().filter(|(jid, _)| query.jids.contains(jid)).map(|(jid, bundle)| (jid.clone(), bundle.clone())).collect() }),
-                                            service_request::Op::ResolveGroup(_) => runner_response::Result::GroupRouting(proto::GroupRouting {
+                                            service_request::Op::ResolveGroup(_) => {
+                                                if state.resend_failure.load(Ordering::SeqCst) == ResendFailure::DisconnectLookup as u8 && !state.sends.lock().await.is_empty() {
+                                                    break;
+                                                }
+                                                runner_response::Result::GroupRouting(proto::GroupRouting {
                                                 participants: vec!["111@s.whatsapp.net".into(), "222@s.whatsapp.net".into()],
                                                 addressing_mode: "pn".into(),
                                                 lid_to_pn: HashMap::new(),
-                                            }),
+                                                })
+                                            },
                                             service_request::Op::SendStanza(stanza) => {
                                                 assert!(!stanza.node.windows(b"application-private-text".len()).any(|b| b == b"application-private-text"));
-                                                state.sends.lock().await.push((tokio::time::Instant::now(), stanza.node));
+                                                let resend = {
+                                                    let mut sends = state.sends.lock().await;
+                                                    sends.push((tokio::time::Instant::now(), stanza.node));
+                                                    sends.len() > 1
+                                                };
                                                 if let Some((observed, release)) = state.send_gate.lock().await.take() {
                                                     observed.notify_one();
                                                     release.notified().await;
@@ -215,7 +234,14 @@ impl Hub {
                                                     2 => break, // Link lost after accepting the stanza.
                                                     _ => {}
                                                 }
-                                                runner_response::Result::Send(proto::SendResult { server_timestamp: 1720000000, participant_hash_mismatch: false })
+                                                if resend {
+                                                    match state.resend_failure.load(Ordering::SeqCst) {
+                                                        2 => failure = Some(proto::Error::new(proto::Code::Unavailable, "synthetic resend refusal")),
+                                                        3 => continue,
+                                                        _ => {}
+                                                    }
+                                                }
+                                                runner_response::Result::Send(proto::SendResult { server_timestamp: 1720000000, participant_hash_mismatch: state.mismatch_next_send.swap(false, Ordering::SeqCst) })
                                             }
                                             service_request::Op::Ping(_) | service_request::Op::ReleaseSession(_) => runner_response::Result::Ok(proto::Ok {}),
                                         };
@@ -337,6 +363,15 @@ impl Hub {
         self.state
             .send_reply
             .store(if disconnect { 2 } else { 1 }, Ordering::SeqCst);
+    }
+    pub fn mismatch_next_send(&self) {
+        self.state.mismatch_next_send.store(true, Ordering::SeqCst);
+    }
+    pub fn fail_resend(&self, failure: ResendFailure) {
+        self.mismatch_next_send();
+        self.state
+            .resend_failure
+            .store(failure as u8, Ordering::SeqCst);
     }
     pub async fn gate_next_send(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let observed = Arc::new(tokio::sync::Notify::new());

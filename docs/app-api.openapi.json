@@ -104,10 +104,10 @@
             "description": "Runner send ceiling reached"
           },
           "503": {
-            "description": "Relay disconnected before queueing the send, or storage/runner unavailable"
+            "description": "Relay disconnected, or storage/runner unavailable before any send acknowledgment. A resend failure after a participant-hash mismatch acknowledgment returns 504 send_unconfirmed with the original message ID."
           },
           "504": {
-            "description": "Send outcome is unconfirmed after queueing. Retain error.message_id for reconciliation; do not automatically retry, because a new request creates another message ID. This ID is not an idempotency key or a lookup endpoint.",
+            "description": "Send outcome is unconfirmed because a queued send lost its answer or a required resend failed after the first acknowledgment. Retain error.message_id for reconciliation; do not automatically retry, because a new request creates another message ID. This ID is not an idempotency key or a lookup endpoint.",
             "content": {
               "application/json": {
                 "schema": {

@@ -687,9 +687,70 @@ async fn a_lost_send_reply_reports_the_original_unconfirmed_message_without_retr
 }
 
 #[tokio::test]
+async fn a_failed_mismatch_resend_keeps_the_original_message_unconfirmed() {
+    for failure in [
+        ResendFailure::DisconnectLookup,
+        ResendFailure::RefuseSend,
+        ResendFailure::LoseReply,
+    ] {
+        let hub = Hub::start().await;
+        let running = start(
+            &hub,
+            "node-resend",
+            Backend::Memory(Arc::new(MemoryRecordStore::new())),
+            false,
+        )
+        .await;
+        let session = running.node.session(SESSION).unwrap();
+        identity(&hub, "node-resend", session.generation).await;
+        let ops = session.ops().unwrap();
+        pair(&*ops).await;
+        ops.set_own_jids("222:1@s.whatsapp.net", Some("22201:1@lid"))
+            .await
+            .unwrap();
+        let (_peer, bundle) = peer("resend-peer").await;
+        hub.bundle("111:1@s.whatsapp.net", bundle).await;
+        hub.fail_resend(failure);
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{}/v1/sessions/{SESSION}/messages",
+                running.http_addr
+            ))
+            .bearer_auth(APP_SECRET)
+            .json(&serde_json::json!({"to":"12345@g.us","text":"application-private-text"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(status, 504, "failure={failure:?}, body={body}");
+        assert_eq!(body["error"]["code"], "send_unconfirmed");
+        let sends = hub.sends().await;
+        assert_eq!(
+            sends.len(),
+            if matches!(failure, ResendFailure::DisconnectLookup) {
+                1
+            } else {
+                2
+            }
+        );
+        for (_, bytes) in sends {
+            let stanza = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                body["error"]["message_id"].as_str().unwrap(),
+                stanza.attrs.get("id").unwrap().as_str()
+            );
+        }
+        running.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_loss() {
     use signal_node::store::SqliteStore;
-    for fence_lost in [false, true] {
+    for (fence_lost, mismatch) in [(false, false), (true, false), (false, true), (true, true)] {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-state");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(format!("send-{}.sqlite", rand::random::<u64>()));
@@ -707,6 +768,9 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
             .unwrap();
         let (_peer, bundle) = peer("mark-failure-peer").await;
         hub.bundle("111:1@s.whatsapp.net", bundle).await;
+        if mismatch {
+            hub.mismatch_next_send();
+        }
         if !fence_lost {
             sqlx::query("CREATE TRIGGER fail_distribution BEFORE INSERT ON signal_records WHEN NEW.ns = 'sender_key_devices' BEGIN SELECT RAISE(ABORT, 'synthetic distribution write failure'); END")
                 .execute(&pool).await.unwrap();
@@ -739,12 +803,24 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
         let body = response.json::<Value>().await.unwrap();
         assert_eq!(
             status, 200,
-            "fence_lost={fence_lost}, error={:?}",
+            "fence_lost={fence_lost}, mismatch={mismatch}, error={:?}",
             body["error"]["code"]
         );
         assert!(body["message_id"].is_string());
         assert_eq!(body["server_timestamp"], 1720000000);
-        assert_eq!(hub.sends().await.len(), 1);
+        let sends = hub.sends().await;
+        let expected_resend = mismatch && !fence_lost;
+        assert_eq!(sends.len(), if expected_resend { 2 } else { 1 });
+        assert_eq!(body["resent"], expected_resend);
+        for (_, bytes) in sends {
+            let stanza = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                body["message_id"].as_str().unwrap(),
+                stanza.attrs.get("id").unwrap().as_str()
+            );
+        }
         if fence_lost {
             assert!(
                 !session.can_serve().await,
