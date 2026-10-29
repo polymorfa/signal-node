@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Polymorfa
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! SQLite driver, for a single host. Every write and lease change runs in a
 //! `BEGIN IMMEDIATE` transaction, which takes SQLite's write lock up front,

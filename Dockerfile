@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates
     && mkdir -p /var/lib/signal-node /etc/signal-node /run/secrets \
     && chown 10001:10001 /var/lib/signal-node
 COPY --from=build /source/target/release/signal-node /usr/local/bin/signal-node
+COPY LICENSE NOTICE /usr/share/licenses/signal-node/
 USER 10001:10001
 WORKDIR /var/lib/signal-node
 EXPOSE 8787

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Polymorfa
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Compiles the runner contract with a pure-Rust protobuf compiler, so
 //! building needs no `protoc` on the host.

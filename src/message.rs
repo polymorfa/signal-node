@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Polymorfa
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Conversions between WhatsApp messages and the application-facing JSON.
 

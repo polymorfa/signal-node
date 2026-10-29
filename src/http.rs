@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Polymorfa
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! The local application API. Every route except `/healthz` requires
 //! `Authorization: Bearer <http.secret>`. See README for the reference.

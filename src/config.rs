@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Copyright (C) 2026 Polymorfa
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Configuration: a TOML file, then `SIGNAL_NODE_*` environment variables on
 //! top. Every secret can also be read from a file (`*_file` keys), so it
