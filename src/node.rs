@@ -631,7 +631,10 @@ impl Node {
     pub async fn shutdown(&self) {
         // Prevent renewal/reacquisition while releasing sessions. Socket closure
         // removes routing claims even if ReleaseSession races the stop signal.
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
+        // Wait for publications that read the previous flag before taking the
+        // session snapshot. Later publications observe shutdown and refuse.
+        drop(self.link.write().expect("link lock"));
         let ids: Vec<String> = self.sessions().iter().map(|s| s.id.clone()).collect();
         for id in ids {
             self.release(&id).await;
@@ -781,6 +784,19 @@ secret = "fixture-application-secret"
         release.await;
         let (next, _) = acquired(&node).await;
         assert!(next.fence.generation > lease.fence.generation);
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_a_late_acquisition_even_without_watch_receivers() {
+        let node = node();
+        let origin = Link::fixture();
+        *node.link.write().unwrap() = Some(origin.clone());
+        let (lease, session) = acquired(&node).await;
+        node.shutdown().await;
+        assert!(*node.shutdown.borrow());
+        assert!(!node.publish_acquired(SESSION, session, &origin));
+        assert!(node.session(SESSION).is_none());
+        node.abandon(SESSION, &lease).await;
     }
 
     #[tokio::test]
