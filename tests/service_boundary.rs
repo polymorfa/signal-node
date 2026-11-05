@@ -462,7 +462,7 @@ async fn app_state_keys_require_separate_consent_and_an_own_device() {
             .command("node-app-state", generation, Op::Receive(receive))
             .await;
         assert!(
-            matches!(replay.body, Some(Body::ServiceResponse(proto::ServiceResponse { result: Some(Out::Receive(proto::ReceiveResult { already_delivered: true, app_state_key_share, .. })) })) if app_state_key_share.is_empty())
+            matches!(replay.body, Some(Body::ServiceResponse(proto::ServiceResponse { result: Some(Out::Receive(proto::ReceiveResult { already_delivered: true, app_state_key_share, .. })) })) if app_state_key_share == expected_bytes)
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
@@ -471,6 +471,95 @@ async fn app_state_keys_require_separate_consent_and_an_own_device() {
         );
         drop(stream);
         running.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn app_state_share_survives_a_lost_reply_and_restart_with_live_consent_checks() {
+    let hub = Hub::start().await;
+    let records = Arc::new(MemoryRecordStore::new());
+    let mut cfg = config("node-share-replay", &hub.url, false);
+    cfg.share_app_state_keys = true;
+    let running = signal_node::start(cfg.clone(), Backend::Memory(records.clone()))
+        .await
+        .unwrap();
+    wait(|| {
+        running
+            .node
+            .session(SESSION)
+            .is_some_and(|s| s.is_claimed())
+    })
+    .await;
+    let generation = running.node.session(SESSION).unwrap().generation;
+    let share = app_state_share();
+    let receive = encrypted(
+        &hub,
+        "node-share-replay",
+        &running,
+        wa::Message {
+            protocol_message: wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
+                app_state_sync_key_share: Some(share.clone()).into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    let first = hub
+        .command(
+            "node-share-replay",
+            generation,
+            Op::Receive(receive.clone()),
+        )
+        .await;
+    let Some(Body::ServiceResponse(proto::ServiceResponse {
+        result: Some(Out::Receive(first)),
+    })) = first.body
+    else {
+        panic!("first receive result missing")
+    };
+    assert!(!first.already_delivered);
+    // Discard the response as if transport dropped it after the delivery write.
+    running.shutdown().await;
+    for consent in [true, false] {
+        cfg.share_app_state_keys = consent;
+        let replacement = signal_node::start(cfg.clone(), Backend::Memory(records.clone()))
+            .await
+            .unwrap();
+        wait(|| {
+            replacement
+                .node
+                .session(SESSION)
+                .is_some_and(|s| s.is_claimed())
+        })
+        .await;
+        let generation = replacement.node.session(SESSION).unwrap().generation;
+        for from_me in [true, false] {
+            let mut retry = receive.clone();
+            retry.is_from_me = from_me;
+            let replay = hub
+                .command("node-share-replay", generation, Op::Receive(retry))
+                .await;
+            let Some(Body::ServiceResponse(proto::ServiceResponse {
+                result: Some(Out::Receive(result)),
+            })) = replay.body
+            else {
+                panic!("receive replay missing")
+            };
+            assert!(result.already_delivered);
+            assert_eq!(
+                result.app_state_key_share,
+                if consent && from_me {
+                    signal_node::message::encode(&share)
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+        replacement.shutdown().await;
     }
 }
 

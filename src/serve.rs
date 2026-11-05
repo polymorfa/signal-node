@@ -270,9 +270,26 @@ async fn receive(
             error
         })?;
     let message = match received {
-        Received::AlreadyDelivered { .. } => {
+        Received::AlreadyDelivered { receipt_key } => {
+            let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
+                let cutoff = crate::node::now_ms()
+                    .saturating_sub(node.cfg.decrypt_buffer_retention.as_millis() as u64);
+                session
+                    .replay_app_state_share(&receipt_key, cutoff)
+                    .await
+                    .map_err(|e| node.ops_error(session, &e))?
+            } else {
+                Vec::new()
+            };
+            if !session.can_serve().await {
+                return Err(proto::Error::new(
+                    Code::NotLeaseHolder,
+                    "the lease expired before receive replay",
+                ));
+            }
             return respond(Out::Receive(ReceiveResult {
                 already_delivered: true,
+                app_state_key_share,
                 ..Default::default()
             }));
         }
@@ -307,6 +324,14 @@ async fn receive(
             Code::NotLeaseHolder,
             "the lease expired before delivery was recorded",
         ));
+    }
+    // The runner has not acknowledged this response. Preserve only the share
+    // before dropping buffered plaintext, so a lost reply remains replayable.
+    if !app_state_key_share.is_empty() {
+        session
+            .save_app_state_share(&message.receipt_key, &app_state_key_share)
+            .await
+            .map_err(|e| node.ops_error(session, &e))?;
     }
     ops.mark_delivered(&message.receipt_key)
         .await

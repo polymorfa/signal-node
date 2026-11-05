@@ -21,6 +21,7 @@ use crate::proto::{
     runner_response, service_request, session_event::State,
 };
 use crate::ratelimit::SendLimiter;
+use crate::share_replay::ShareReplay;
 use crate::store::Backend;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -63,6 +64,7 @@ pub struct ActiveSession {
     pub generation: u64,
     lease: Mutex<Lease>,
     store: Arc<Store>,
+    shares: ShareReplay<Backend, AesGcmSealer>,
     ops: OnceCell<Arc<Ops>>,
     claimed: AtomicBool,
     claiming: AtomicBool,
@@ -80,6 +82,22 @@ impl ActiveSession {
     /// Surviving local uploaded prekeys, checked against this store's fence.
     pub(crate) async fn uploaded_prekey_count(&self) -> Result<u32, OpsError> {
         Ok(self.store.uploaded_prekey_count().await?)
+    }
+
+    pub(crate) async fn save_app_state_share(
+        &self,
+        receipt: &str,
+        share: &[u8],
+    ) -> Result<(), OpsError> {
+        Ok(self.shares.save(receipt, share, now_ms()).await?)
+    }
+
+    pub(crate) async fn replay_app_state_share(
+        &self,
+        receipt: &str,
+        cutoff: u64,
+    ) -> Result<Vec<u8>, OpsError> {
+        Ok(self.shares.load(receipt, cutoff).await?)
     }
 
     /// The Signal operations, creating the device keys on first use.
@@ -222,13 +240,16 @@ impl Node {
     pub fn lose(&self, id: &str, generation: u64, why: &str) {
         let removed = {
             let mut sessions = self.sessions.write().expect("sessions lock");
-            if sessions.get(id).is_none_or(|s| s.generation != generation) {
+            let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
                 return;
-            }
+            };
+            // A lease tick must see the refused fence before the missing
+            // session, even when the later durable release fails.
+            session.lost.store(true, Ordering::SeqCst);
+            self.remember_abandoned(id, generation);
             sessions.remove(id)
         };
         if let Some(session) = removed {
-            session.lost.store(true, Ordering::SeqCst);
             tracing::warn!(
                 session = id,
                 generation = session.generation,
@@ -310,9 +331,10 @@ impl Node {
         let sealer = Arc::new(AesGcmSealer::new(&data_key));
         let store = Arc::new(RecordSignalStore::new(
             self.backend.clone(),
-            sealer,
+            sealer.clone(),
             lease.fence.clone(),
         ));
+        let shares = ShareReplay::new(self.backend.clone(), sealer, lease.fence.clone());
         let ops = OnceCell::new();
         match SignalOps::open(store.clone()).await {
             Ok(opened) => {
@@ -326,6 +348,7 @@ impl Node {
             generation: lease.fence.generation,
             lease: Mutex::new(lease),
             store,
+            shares,
             ops,
             claimed: AtomicBool::new(false),
             claiming: AtomicBool::new(false),
@@ -565,12 +588,13 @@ impl Node {
             let result = async {
                 let buffered = ops.prune_decrypt_buffer(buffer_cutoff).await?;
                 let sent = ops.prune_sent_messages(sent_cutoff).await?;
-                Ok::<_, OpsError>((buffered, sent))
+                let shares = session.shares.prune(buffer_cutoff).await?;
+                Ok::<_, OpsError>((buffered, sent, shares))
             }
             .await;
             match result {
-                Ok((buffered, sent)) if buffered + sent > 0 => {
-                    tracing::info!(session = %session.id, buffered, sent, "pruned expired records")
+                Ok((buffered, sent, shares)) if buffered + sent + shares > 0 => {
+                    tracing::info!(session = %session.id, buffered, sent, shares, "pruned expired records")
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -784,6 +808,52 @@ secret = "fixture-application-secret"
         release.await;
         let (next, _) = acquired(&node).await;
         assert!(next.fence.generation > lease.fence.generation);
+    }
+
+    #[tokio::test]
+    async fn losing_a_fence_records_refusal_before_exposing_a_missing_session() {
+        let node = node();
+        let (lease, session) = acquired(&node).await;
+        node.sessions
+            .write()
+            .unwrap()
+            .insert(SESSION.into(), session.clone());
+        let removal_is_locked = {
+            let held = node.abandoned.write().unwrap();
+            let losing = {
+                let node = node.clone();
+                std::thread::spawn(move || {
+                    node.lose(SESSION, lease.fence.generation, "fixture refusal")
+                })
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !session.is_lost() {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // Refusal is waiting for the held map. No lease tick may observe a
+            // missing session until that refusal has become visible.
+            let locked = session.is_lost() && node.sessions.try_read().is_err();
+            drop(held);
+            losing.join().unwrap();
+            locked
+        };
+        assert!(removal_is_locked);
+        assert!(node.session(SESSION).is_none());
+        assert_eq!(
+            node.abandoned.read().unwrap().get(SESSION),
+            Some(&session.generation)
+        );
+        *node.link.write().unwrap() = Some(Link::fixture());
+        node.tick_leases().await;
+        assert!(
+            node.session(SESSION).is_none(),
+            "the refused generation was served again"
+        );
+        let (next, _) = acquired(&node).await;
+        assert!(next.fence.generation > session.generation);
     }
 
     #[tokio::test]

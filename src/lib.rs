@@ -25,6 +25,7 @@ pub mod ratelimit;
 pub mod resolver;
 pub mod send;
 pub mod serve;
+mod share_replay;
 pub mod store;
 
 use std::net::SocketAddr;
