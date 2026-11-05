@@ -241,9 +241,18 @@ impl Node {
     /// Give a session up voluntarily: tell Polymorfa, then release the lease
     /// so another node can take it at once.
     pub async fn release(&self, id: &str) {
-        let removed = self.sessions.write().expect("sessions lock").remove(id);
+        let removed = {
+            let mut sessions = self.sessions.write().expect("sessions lock");
+            let removed = sessions.remove(id);
+            if let Some(session) = &removed {
+                session.lost.store(true, Ordering::SeqCst);
+                // Publish the refusal before a lease tick can observe the
+                // missing session, and before either release can suspend.
+                self.remember_abandoned(id, session.generation);
+            }
+            removed
+        };
         let Some(session) = removed else { return };
-        session.lost.store(true, Ordering::SeqCst);
         if let Some(link) = self.link()
             && session.is_claimed()
         {
@@ -253,9 +262,7 @@ impl Node {
             }
         }
         let lease = session.lease().await;
-        if let Err(e) = self.backend.release(&lease).await {
-            tracing::warn!(session = id, error = %e, "could not release the lease; it will expire");
-        }
+        self.abandon(id, &lease).await;
         tracing::info!(
             session = id,
             generation = session.generation,
@@ -331,6 +338,25 @@ impl Node {
         }))
     }
 
+    /// Publish only while the connection that began acquisition is current.
+    /// Holding the link read lock through insertion orders publication before
+    /// disconnect's link removal and subsequent session snapshot.
+    fn publish_acquired(&self, id: &str, session: Arc<ActiveSession>, origin: &Arc<Link>) -> bool {
+        let current = self.link.read().expect("link lock");
+        if *self.shutdown.borrow()
+            || !current
+                .as_ref()
+                .is_some_and(|link| Arc::ptr_eq(link, origin) && !link.is_closed())
+        {
+            return false;
+        }
+        self.sessions
+            .write()
+            .expect("sessions lock")
+            .insert(id.to_owned(), session);
+        true
+    }
+
     /// One pass over every configured session: renew what we hold, try to
     /// take what is free, and claim anything Polymorfa has not accepted yet.
     pub async fn tick_leases(self: &Arc<Self>) {
@@ -378,9 +404,7 @@ impl Node {
                 }
                 None => {
                     // A partitioned replica must leave free leases for a healthy one.
-                    if self.link().is_none() {
-                        continue;
-                    }
+                    let Some(origin) = self.link() else { continue };
                     let acquired = self
                         .backend
                         .acquire(id, &self.lease_holder, now_ms(), ttl)
@@ -404,20 +428,16 @@ impl Node {
                             }
                             match self.activate(lease.clone()).await {
                                 Ok(session) => {
-                                    if *self.shutdown.borrow() {
-                                        let _ = self.backend.release(&lease).await;
+                                    if !self.publish_acquired(id, session.clone(), &origin) {
+                                        self.abandon(id, &lease).await;
                                         continue;
                                     }
                                     tracing::info!(session = %id, generation, "took session lease");
-                                    self.sessions
-                                        .write()
-                                        .expect("sessions lock")
-                                        .insert(id.clone(), session.clone());
                                     self.spawn_claim(session);
                                 }
                                 Err(e) => {
                                     tracing::error!(session = %id, error = %e, "cannot serve session; releasing its lease");
-                                    let _ = self.backend.release(&lease).await;
+                                    self.abandon(id, &lease).await;
                                 }
                             }
                         }
@@ -444,14 +464,16 @@ impl Node {
     /// case the release fails, so this process never serves that fence again.
     async fn abandon(&self, id: &str, lease: &Lease) {
         let generation = lease.fence.generation;
-        {
-            let mut abandoned = self.abandoned.write().expect("abandoned lock");
-            let entry = abandoned.entry(id.to_owned()).or_insert(generation);
-            *entry = (*entry).max(generation);
-        }
+        self.remember_abandoned(id, generation);
         if let Err(e) = self.backend.release(lease).await {
             tracing::warn!(session = id, generation, error = %e, "abandoned lease release failed; its fence stays refused");
         }
+    }
+
+    fn remember_abandoned(&self, id: &str, generation: u64) {
+        let mut abandoned = self.abandoned.write().expect("abandoned lock");
+        let entry = abandoned.entry(id.to_owned()).or_insert(generation);
+        *entry = (*entry).max(generation);
     }
 
     fn spawn_claim(&self, session: Arc<ActiveSession>) {
@@ -685,5 +707,102 @@ impl Handler for Node {
         for id in ids {
             self.release(&id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use wacore_recordstore::MemoryRecordStore;
+
+    const SESSION: &str = "fixture-session";
+
+    fn node() -> Arc<Node> {
+        let cfg = Config::from_toml(
+            r#"
+node_id = "fixture-node"
+[polymorfa]
+url = "ws://127.0.0.1:1/signal"
+credential = "fixture-project-principal"
+sessions = ["fixture-session"]
+[storage]
+driver = "memory"
+master_key = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk="
+[http]
+listen = "127.0.0.1:0"
+secret = "fixture-application-secret"
+"#,
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        Node::new(cfg, Backend::Memory(Arc::new(MemoryRecordStore::new())))
+    }
+
+    async fn acquired(node: &Node) -> (Lease, Arc<ActiveSession>) {
+        let lease = node
+            .backend
+            .acquire(SESSION, &node.lease_holder, now_ms(), node.cfg.lease_ttl_ms)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = node.activate(lease.clone()).await.unwrap();
+        (lease, session)
+    }
+
+    #[tokio::test]
+    async fn release_refuses_the_fence_before_waiting_for_storage() {
+        let node = node();
+        let (lease, session) = acquired(&node).await;
+        node.sessions
+            .write()
+            .unwrap()
+            .insert(SESSION.into(), session.clone());
+        // Suspend release before durable storage can acknowledge it. Even if
+        // that operation later fails, acquisition must already refuse the fence.
+        let held = session.lease.lock().await;
+        let mut release = std::pin::pin!(node.release(SESSION));
+        assert!(matches!(
+            release
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        assert!(session.is_lost());
+        assert!(node.session(SESSION).is_none());
+        assert_eq!(
+            node.abandoned.read().unwrap().get(SESSION),
+            Some(&lease.fence.generation)
+        );
+        drop(held);
+        release.await;
+        let (next, _) = acquired(&node).await;
+        assert!(next.fence.generation > lease.fence.generation);
+    }
+
+    #[tokio::test]
+    async fn acquisition_cannot_publish_after_its_link_disconnects_or_is_replaced() {
+        let node = node();
+        let origin = Link::fixture();
+        *node.link.write().unwrap() = Some(origin.clone());
+        let (lease, session) = acquired(&node).await;
+
+        // Acquisition/activation awaited storage while disconnect took its
+        // session snapshot. The late result must never become a live session.
+        node.disconnected().await;
+        assert!(!node.publish_acquired(SESSION, session.clone(), &origin));
+        assert!(node.session(SESSION).is_none());
+        let successor = Link::fixture();
+        *node.link.write().unwrap() = Some(successor.clone());
+        assert!(!node.publish_acquired(SESSION, session.clone(), &origin));
+        node.abandon(SESSION, &lease).await;
+
+        let (_, next) = acquired(&node).await;
+        assert!(node.publish_acquired(SESSION, next, &successor));
+        node.disconnected().await;
+        assert!(node.session(SESSION).is_none());
     }
 }

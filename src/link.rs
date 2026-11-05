@@ -78,6 +78,19 @@ pub struct Link {
 }
 
 impl Link {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Arc<Self> {
+        let (out, _) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            out,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            welcome: Welcome::default(),
+            timeout: Duration::from_secs(1),
+            closed: watch::channel(false).0,
+        })
+    }
+
     pub fn welcome(&self) -> &Welcome {
         &self.welcome
     }
