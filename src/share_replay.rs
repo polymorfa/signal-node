@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Sealed own-device key shares that survive a lost runner receive response.
 //! No application plaintext is retained here. Entries share the decrypt
