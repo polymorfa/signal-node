@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! The [`SendContextResolver`] the stanza builder uses, answered by Polymorfa
 //! over the link: device lists (`ResolveDevices`), prekey bundles

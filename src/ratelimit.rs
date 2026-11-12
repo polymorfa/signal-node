@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Client-side send ceiling: at most `limit` sends in any one-second window
 //! per session, matching `Welcome.max_sends_per_second`. Polymorfa enforces

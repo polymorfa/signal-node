@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
+authors = ["Polymorfa (Softium LLC)"]
 description = "Self-hosted Signal service for Polymorfa zero-knowledge sessions"
 repository = "https://github.com/polymorfa/signal-node"
 publish = false
