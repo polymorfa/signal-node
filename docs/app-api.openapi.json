@@ -1,0 +1,608 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Signal node local application API",
+    "version": "1",
+    "description": "Server-only sidecar boundary. App bearer secret is distinct from the upstream Polymorfa project credential. History delivery is off by default and requires explicit operator consent."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8787"
+    }
+  ],
+  "security": [
+    {
+      "appBearer": []
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "health",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sessions"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid application secret"
+          },
+          "403": {
+            "description": "Origin-bearing browser request is refused"
+          }
+        }
+      }
+    },
+    "/v1/sessions/{id}/messages": {
+      "post": {
+        "operationId": "sendMessage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "404": {
+            "description": "Unknown configured session"
+          },
+          "409": {
+            "description": "Not lease holder, unpaired or unavailable session"
+          },
+          "429": {
+            "description": "Runner send ceiling reached"
+          },
+          "503": {
+            "description": "Relay disconnected, or storage/runner unavailable before any send acknowledgment. A resend failure after a participant-hash mismatch acknowledgment returns 504 send_unconfirmed with the original message ID."
+          },
+          "504": {
+            "description": "Send outcome is unconfirmed because a queued send lost its answer or a required resend failed after the first acknowledgment. Retain error.message_id for reconciliation; do not automatically retry, because a new request creates another message ID. This ID is not an idempotency key or a lookup endpoint.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnconfirmedSend"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid application secret"
+          },
+          "403": {
+            "description": "Origin-bearing browser request is refused"
+          }
+        }
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "operationId": "events",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE records use Event JSON with id and event fields. No server cursor replay: unacknowledged ciphertext must be retried by the relay.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SSE delivery disabled"
+          },
+          "401": {
+            "description": "Missing or invalid application secret"
+          },
+          "403": {
+            "description": "Origin-bearing browser request is refused"
+          }
+        }
+      }
+    },
+    "/v1/events/{id}/ack": {
+      "post": {
+        "operationId": "ackEvent",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Application acknowledgement accepted"
+          },
+          "404": {
+            "description": "No active delivery waits for this event ID"
+          },
+          "401": {
+            "description": "Missing or invalid application secret"
+          },
+          "403": {
+            "description": "Origin-bearing browser request is refused"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "appBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "MediaDescriptor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "direct_path",
+          "media_key",
+          "file_sha256",
+          "file_enc_sha256",
+          "file_length",
+          "mimetype"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "image",
+              "video",
+              "audio",
+              "document",
+              "sticker"
+            ]
+          },
+          "direct_path": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "media_key": {
+            "type": "string"
+          },
+          "file_sha256": {
+            "type": "string"
+          },
+          "file_enc_sha256": {
+            "type": "string"
+          },
+          "mimetype": {
+            "type": "string"
+          },
+          "caption": {
+            "type": "string"
+          },
+          "file_name": {
+            "type": "string"
+          },
+          "file_length": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "height": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "media_key_timestamp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ptt": {
+            "type": "boolean"
+          }
+        }
+      },
+      "HistoryDescriptor": {
+        "type": "object",
+        "required": [
+          "notification_proto"
+        ],
+        "properties": {
+          "direct_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "media_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_enc_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "original_message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "peer_data_request_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inline_payload": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sync_type": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "chunk_order": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "progress": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "file_length": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "notification_proto": {
+            "type": "string"
+          }
+        }
+      },
+      "Event": {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "session_id",
+          "chat",
+          "sender",
+          "message_id",
+          "timestamp",
+          "is_from_me",
+          "redelivered",
+          "identity_changed",
+          "message_proto"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "message",
+              "history.sync"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "chat": {
+            "type": "string"
+          },
+          "sender": {
+            "type": "string"
+          },
+          "sender_alt": {
+            "type": "string"
+          },
+          "message_id": {
+            "type": "string"
+          },
+          "message_proto": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_from_me": {
+            "type": "boolean"
+          },
+          "redelivered": {
+            "type": "boolean"
+          },
+          "identity_changed": {
+            "type": "boolean"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaDescriptor"
+          },
+          "history": {
+            "$ref": "#/components/schemas/HistoryDescriptor"
+          }
+        }
+      },
+      "SendRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "to"
+        ],
+        "properties": {
+          "to": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "media": {
+            "$ref": "#/components/schemas/MediaDescriptor"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "text"
+            ],
+            "not": {
+              "required": [
+                "media"
+              ]
+            }
+          },
+          {
+            "required": [
+              "media"
+            ],
+            "not": {
+              "required": [
+                "text"
+              ]
+            }
+          }
+        ]
+      },
+      "UnconfirmedSend": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message", "message_id"],
+            "properties": {
+              "code": { "type": "string", "const": "send_unconfirmed" },
+              "message": { "type": "string" },
+              "message_id": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      },
+      "SendOutcome": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "server_timestamp",
+          "resent"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string"
+          },
+          "server_timestamp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "resent": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "lease_generation",
+          "claimed",
+          "has_device_keys",
+          "state",
+          "pn",
+          "lid"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "lease_generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "claimed": {
+            "type": "boolean"
+          },
+          "has_device_keys": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          },
+          "pn": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Sessions": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "sessions"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionInfo"
+            }
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-webhook": {
+    "contentType": "application/json",
+    "eventSchema": {
+      "$ref": "#/components/schemas/Event"
+    },
+    "headers": {
+      "Signal-Node-Timestamp": "Unix seconds",
+      "Signal-Node-Signature": "v1= lowercase hex HMAC-SHA256(secret, timestamp + . + exact body bytes)",
+      "Signal-Node-Event-Id": "Event.id"
+    },
+    "acknowledgement": "Any 2xx response confirms the application durably accepted the event. Redirects are refused."
+  }
+}
