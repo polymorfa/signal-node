@@ -34,16 +34,16 @@
         }
       }
     },
-    "/v1/sessions": {
+    "/v1/connections": {
       "get": {
-        "operationId": "listSessions",
+        "operationId": "listConnections",
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Sessions"
+                  "$ref": "#/components/schemas/Connections"
                 }
               }
             }
@@ -57,7 +57,7 @@
         }
       }
     },
-    "/v1/sessions/{id}/messages": {
+    "/v1/connections/{id}/messages": {
       "post": {
         "operationId": "sendMessage",
         "parameters": [
@@ -95,10 +95,10 @@
             "description": "Invalid request"
           },
           "404": {
-            "description": "Unknown configured session"
+            "description": "Unknown configured connection"
           },
           "409": {
-            "description": "Not lease holder, unpaired or unavailable session"
+            "description": "Not lease holder, unpaired or unavailable connection"
           },
           "429": {
             "description": "Runner send ceiling reached"
@@ -130,7 +130,7 @@
         "operationId": "events",
         "parameters": [
           {
-            "name": "session_id",
+            "name": "connection_id",
             "in": "query",
             "schema": {
               "type": "string"
@@ -356,7 +356,7 @@
         "required": [
           "id",
           "type",
-          "session_id",
+          "connection_id",
           "chat",
           "sender",
           "message_id",
@@ -377,7 +377,7 @@
               "history.sync"
             ]
           },
-          "session_id": {
+          "connection_id": {
             "type": "string"
           },
           "chat": {
@@ -496,7 +496,7 @@
           }
         }
       },
-      "SessionInfo": {
+      "ConnectionInfo": {
         "type": "object",
         "required": [
           "id",
@@ -538,20 +538,20 @@
           }
         }
       },
-      "Sessions": {
+      "Connections": {
         "type": "object",
         "required": [
           "node_id",
-          "sessions"
+          "connections"
         ],
         "properties": {
           "node_id": {
             "type": "string"
           },
-          "sessions": {
+          "connections": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/SessionInfo"
+              "$ref": "#/components/schemas/ConnectionInfo"
             }
           }
         }

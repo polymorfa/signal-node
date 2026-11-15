@@ -24,7 +24,7 @@ pub struct Event {
     /// `message` or `history.sync`.
     #[serde(rename = "type")]
     pub kind: &'static str,
-    pub session_id: String,
+    pub connection_id: String,
     pub chat: String,
     pub sender: String,
     #[serde(skip_serializing_if = "Option::is_none")]

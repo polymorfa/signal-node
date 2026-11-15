@@ -22,7 +22,7 @@ use tokio::{
 use tokio_tungstenite::tungstenite;
 
 pub const APP_SECRET: &str = "fixture-application-secret";
-pub const SESSION: &str = "session-fixture";
+pub const CONNECTION: &str = "connection-fixture";
 type SendGate = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 struct State {
     connections: Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -153,7 +153,7 @@ impl Hub {
                     };
                     assert_eq!(hello.protocol_version, 1);
                     let node_id = hello.node_id;
-                    let connection_id =
+                    let link_id =
                         format!("{node_id}:{}", state.next.fetch_add(1, Ordering::SeqCst));
                     let (disconnect_tx, mut disconnect_rx) = oneshot::channel();
                     state
@@ -197,14 +197,14 @@ impl Hub {
                                         let op = request.op.unwrap();
                                         let mut failure = None;
                                         let result = match op {
-                                            service_request::Op::ClaimSession(claim) => {
+                                            service_request::Op::ClaimConnection(claim) => {
                                                 let mut claims = state.claims.lock().await;
-                                                if claims.get(&request.session_id).is_some_and(|(generation, owner)| *generation > claim.generation || *generation == claim.generation && *owner != connection_id) {
+                                                if claims.get(&request.connection_id).is_some_and(|(generation, owner)| *generation > claim.generation || *generation == claim.generation && *owner != link_id) {
                                                     failure = Some(proto::Error::new(proto::Code::NotLeaseHolder, "stale claim"));
                                                 } else {
-                                                    claims.insert(request.session_id.clone(), (claim.generation, connection_id.clone()));
+                                                    claims.insert(request.connection_id.clone(), (claim.generation, link_id.clone()));
                                                 }
-                                                runner_response::Result::SessionClaimed(proto::SessionClaimed { state: proto::session_event::State::Connected as i32, pn: "222:1@s.whatsapp.net".into(), lid: String::new() })
+                                                runner_response::Result::ConnectionClaimed(proto::ConnectionClaimed { state: proto::connection_event::State::Connected as i32, pn: "222:1@s.whatsapp.net".into(), lid: String::new() })
                                             }
                                             service_request::Op::ResolveDevices(_) => runner_response::Result::Devices(proto::Devices { jids: state.bundles.lock().await.keys().cloned().collect() }),
                                             service_request::Op::FetchPreKeys(query) => runner_response::Result::Bundles(proto::Bundles { bundles: state.bundles.lock().await.iter().filter(|(jid, _)| query.jids.contains(jid)).map(|(jid, bundle)| (jid.clone(), bundle.clone())).collect() }),
@@ -243,7 +243,7 @@ impl Hub {
                                                 }
                                                 runner_response::Result::Send(proto::SendResult { server_timestamp: 1720000000, participant_hash_mismatch: state.mismatch_next_send.swap(false, Ordering::SeqCst) })
                                             }
-                                            service_request::Op::Ping(_) | service_request::Op::ReleaseSession(_) => runner_response::Result::Ok(proto::Ok {}),
+                                            service_request::Op::Ping(_) | service_request::Op::ReleaseConnection(_) => runner_response::Result::Ok(proto::Ok {}),
                                         };
                                         let body = match failure { Some(error) => Body::Error(error), None => Body::RunnerResponse(proto::RunnerResponse { result: Some(result) }) };
                                         tx.send(proto::Frame::with(frame.id, body).encode_to_vec()).unwrap();
@@ -273,7 +273,7 @@ impl Hub {
         self.request(
             node,
             proto::RunnerRequest {
-                session_id: SESSION.into(),
+                connection_id: CONNECTION.into(),
                 lease_generation: generation,
                 op: Some(op),
             },
@@ -392,7 +392,7 @@ pub fn config(node: &str, url: &str, history: bool) -> signal_node::config::Reso
  [polymorfa]
  url="{url}"
  credential="fixture-project-principal"
- sessions=["{SESSION}"]
+ connections=["{CONNECTION}"]
  request_timeout_ms=1000
  reconnect_min_ms=10
  reconnect_max_ms=50
@@ -420,7 +420,7 @@ pub async fn start(hub: &Hub, node: &str, backend: Backend, history: bool) -> si
     wait(|| {
         running
             .node
-            .session(SESSION)
+            .connection(CONNECTION)
             .is_some_and(|s| s.is_claimed())
     })
     .await;

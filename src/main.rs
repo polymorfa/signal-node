@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let running = signal_node::start(resolved, backend).await?;
 
     wait_for_stop().await;
-    tracing::info!("stopping: releasing sessions");
+    tracing::info!("stopping: releasing connections");
     running.shutdown().await;
     Ok(())
 }

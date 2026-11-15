@@ -50,7 +50,7 @@ impl Runtime for TokioRuntime {
 
 pub struct RemoteResolver {
     pub link: Arc<Link>,
-    pub session_id: String,
+    pub connection_id: String,
     pub generation: u64,
 }
 
@@ -91,7 +91,7 @@ pub fn remote_bundle(bundle: &proto::Bundle) -> anyhow::Result<RemoteBundle> {
 impl RemoteResolver {
     async fn ask(&self, op: service_request::Op) -> anyhow::Result<runner_response::Result> {
         self.link
-            .request(&self.session_id, self.generation, op)
+            .request(&self.connection_id, self.generation, op)
             .await
             .map_err(|e: LinkError| anyhow::Error::new(e))
     }
