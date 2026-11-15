@@ -300,7 +300,7 @@ async fn consume_pending(
         chat: "111@s.whatsapp.net".into(),
         sender: "111:1@s.whatsapp.net".into(),
         message_id: "upload-consumption".into(),
-        kind: encrypted.kind.wire().into(),
+        kind: encrypted.kind.as_str().into(),
         ciphertext: encrypted.ciphertext,
         padding_version: 2,
         is_from_me: false,

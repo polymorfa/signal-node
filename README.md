@@ -160,3 +160,21 @@ cargo build --release --locked
 Without the PostgreSQL variable, local tests explicitly report that PG conformance was not exercised. CI requires it. Tests exercise real SQLite and PostgreSQL store conformance; per-slot authentication; a fake Polymorfa WebSocket with Hello/Welcome/claims; actual two-device Signal encryption/decryption; signed webhook failure/ACK and SSE delivery; encrypted SendStanza; consent-off history; expiry, stale writes and crash replay; and the five-per-second ceiling. The transport peer is a fixture, not a real runner or WhatsApp account.
 
 Release still requires the pinned library producer to merge, backend/SDK/CLI/docs consumers to integrate on explicit revisions, real-account pairing/send/receive/media/history/group/retry acceptance, and the private AGPL/legal review plus owner publication approval. Repository visibility, package/image publication and production rollout controls remain unchanged by this implementation. The service adds no staff control authority; backend-owned eligibility and counts-only diagnostics stay in the Polymorfa control plane.
+
+## Receiving status publications
+
+`RunnerRequest.status_receive` is a distinct operation. Implement it before
+accepting status publications: the nested `Receive` preserves origin, sender,
+alternate identity and provider time; `status_kind` identifies personal, group
+or channel scope. Apply `status_session` only to pairwise `pkmsg`/`msg` session
+storage, keeping identity keys and prekeys shared. Sender keys retain their
+existing group/sender scope. Keep phone-number to linked-identity migration,
+identity replacement and session deletion consistent across both session stores.
+
+An older service must return `CODE_UNSUPPORTED` without decrypting, delivering
+or changing a chat session. Do not fall back to `receive`. The response remains
+`ServiceResponse.receive`; plaintext stays in the customer-owned service.
+The receiver delivers `status.received` with `status_scope` and the existing shared
+content fields. Group publications retain their full protobuf while text and
+media use the wrapped publication content. Replies and mention notifications
+remain messages. Local synthetic tests do not establish live rollout eligibility.

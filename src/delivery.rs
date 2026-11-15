@@ -255,6 +255,7 @@ mod tests {
         Event {
             id: id.into(),
             kind: "message",
+            status_scope: None,
             session_id: "s".into(),
             chat: "c".into(),
             sender: "x".into(),

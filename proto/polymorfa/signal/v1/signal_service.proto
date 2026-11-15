@@ -99,6 +99,8 @@ message RunnerRequest {
     Resend resend = 17;
     ForgetIdentity forget_identity = 18;
     MigratePnToLid migrate_pn_to_lid = 19;
+    // A distinct operation prevents old services from using the chat ratchet.
+    StatusReceive status_receive = 22;
     PreparePreKeyUpload prepare_pre_key_upload = 20;
     AcknowledgePreKeyUpload acknowledge_pre_key_upload = 21;
   }
@@ -212,6 +214,19 @@ message Receive {
   int64 timestamp = 8;
   // Sender's alternate JID (PN for a LID sender and vice versa), if known.
   string sender_alt = 9;
+}
+
+// StatusReceive must be explicitly implemented. An unsupported service returns
+// CODE_UNSUPPORTED without decrypting, delivering or mutating a chat session.
+// The response uses ServiceResponse.receive and retains the no-plaintext contract.
+message StatusReceive {
+  Receive payload = 1;
+  // "personal", "group" or "channel". This is publication provenance,
+  // never inferred from quoted content or a status mention notification.
+  string status_kind = 2;
+  // Use the sender's separate pairwise status session for pkmsg/msg only.
+  // Identity keys and prekeys remain shared. skmsg keeps its sender-key scope.
+  bool status_session = 3;
 }
 
 message ReceiveResult {

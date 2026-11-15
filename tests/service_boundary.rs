@@ -1354,3 +1354,138 @@ async fn a_node_without_a_live_link_takes_no_leases() {
     assert!(node.session(SESSION).is_none());
     node.shutdown().await;
 }
+
+#[tokio::test]
+async fn encrypted_status_uses_scoped_session_and_separate_publication_event() {
+    let hub = Hub::start().await;
+    let records = Arc::new(MemoryRecordStore::new());
+    let running = start(&hub, "node-status", Backend::Memory(records.clone()), false).await;
+    let generation = running.node.session(SESSION).unwrap().generation;
+    let mut receive = encrypted(
+        &hub,
+        "node-status",
+        &running,
+        wa::Message {
+            conversation: Some("application-private-text".into()),
+            ..Default::default()
+        },
+        false,
+    )
+    .await;
+    receive.chat = "status@broadcast".into();
+    let invalid_scope = hub
+        .command(
+            "node-status",
+            generation,
+            Op::StatusReceive(proto::StatusReceive {
+                payload: Some(receive.clone()),
+                status_kind: "group".into(),
+                status_session: true,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(invalid_scope.body, Some(Body::Error(proto::Error {code, ..})) if code == proto::Code::InvalidArgument as i32)
+    );
+    assert!(
+        records
+            .scan_keys(SESSION, Namespace::Session, "", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let client = reqwest::Client::new();
+    let url = format!("http://{}", running.http_addr);
+    let mut stream = client
+        .get(format!("{url}/v1/events"))
+        .bearer_auth(APP_SECRET)
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let command = hub.command(
+        "node-status",
+        generation,
+        Op::StatusReceive(proto::StatusReceive {
+            payload: Some(receive.clone()),
+            status_kind: "personal".into(),
+            status_session: true,
+        }),
+    );
+    let app = async {
+        let event = next_event(&mut stream).await;
+        assert_eq!(event["text"], "application-private-text");
+        assert_eq!(event["type"], "status.received");
+        assert_eq!(event["status_scope"], "personal");
+        assert!(!event["redelivered"].as_bool().unwrap());
+        assert_eq!(
+            client
+                .post(format!(
+                    "{url}/v1/events/{}/ack",
+                    event["id"].as_str().unwrap()
+                ))
+                .bearer_auth(APP_SECRET)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        event
+    };
+    let (response, event) = tokio::join!(command, app);
+    assert!(matches!(
+        response.body,
+        Some(Body::ServiceResponse(proto::ServiceResponse {
+            result: Some(Out::Receive(proto::ReceiveResult {
+                already_delivered: false,
+                ..
+            }))
+        }))
+    ));
+    let again = hub
+        .command(
+            "node-status",
+            generation,
+            Op::StatusReceive(proto::StatusReceive {
+                payload: Some(receive),
+                status_kind: "personal".into(),
+                status_session: true,
+            }),
+        )
+        .await;
+    assert!(matches!(
+        again.body,
+        Some(Body::ServiceResponse(proto::ServiceResponse {
+            result: Some(Out::Receive(proto::ReceiveResult {
+                already_delivered: true,
+                ..
+            }))
+        }))
+    ));
+    for ns in Namespace::ALL {
+        for key in records.scan_keys(SESSION, ns, "", None).await.unwrap() {
+            let value = records.get(SESSION, ns, &key).await.unwrap().unwrap();
+            assert!(
+                !value
+                    .windows(b"application-private-text".len())
+                    .any(|part| part == b"application-private-text")
+            );
+        }
+    }
+    assert_eq!(
+        client
+            .post(format!(
+                "{url}/v1/events/{}/ack",
+                event["id"].as_str().unwrap()
+            ))
+            .bearer_auth(APP_SECRET)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    drop(stream);
+    running.shutdown().await;
+}

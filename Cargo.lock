@@ -3245,7 +3245,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "aes 0.9.3",
  "anyhow",
@@ -3264,6 +3264,7 @@ dependencies = [
  "event-listener",
  "fluent-uri",
  "futures",
+ "getrandom 0.4.3",
  "hashbrown 0.17.1",
  "hex",
  "hkdf 0.13.0",
@@ -3293,7 +3294,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "anyhow",
  "buffa",
@@ -3314,7 +3315,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "bytes",
  "compact_str",
@@ -3331,7 +3332,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3341,7 +3342,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "aes 0.9.3",
  "async-lock",
@@ -3372,7 +3373,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "anyhow",
  "buffa",
@@ -3390,9 +3391,10 @@ dependencies = [
 [[package]]
 name = "wacore-recordstore"
 version = "0.1.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "aes-gcm 0.11.1",
+ "async-lock",
  "async-trait",
  "bytes",
  "rand 0.10.3",
@@ -3403,7 +3405,7 @@ dependencies = [
 [[package]]
 name = "wacore-signal-ops"
 version = "0.1.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -3411,6 +3413,7 @@ dependencies = [
  "bytes",
  "hex",
  "rand 0.10.3",
+ "serde",
  "sha2 0.11.0",
  "thiserror",
  "wacore",
@@ -3431,7 +3434,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "git+https://github.com/polymorfa/whatsapp-rust?rev=4b3b13cacd40a27573d0246386db553ef887539b#4b3b13cacd40a27573d0246386db553ef887539b"
+source = "git+https://github.com/polymorfa/whatsapp-rust?rev=90df5a8728e23afe2331bf9c26a74f7318c5a8dc#90df5a8728e23afe2331bf9c26a74f7318c5a8dc"
 dependencies = [
  "buffa",
  "buffa-build",

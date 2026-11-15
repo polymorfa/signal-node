@@ -21,10 +21,13 @@ pub struct Event {
     /// Stable across redeliveries of the same ciphertext; use it to
     /// deduplicate and to acknowledge.
     pub id: String,
-    /// `message` or `history.sync`.
+    /// `message`, `status.received` or `history.sync`.
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub session_id: String,
+    /// Publication audience; replies and mentions remain ordinary messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_scope: Option<String>,
     pub chat: String,
     pub sender: String,
     #[serde(skip_serializing_if = "Option::is_none")]
