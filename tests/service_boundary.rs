@@ -1489,3 +1489,141 @@ async fn encrypted_status_uses_scoped_session_and_separate_publication_event() {
     drop(stream);
     running.shutdown().await;
 }
+
+#[tokio::test]
+async fn legacy_group_publication_classification_survives_duplicate_delivery() {
+    let hub = Hub::start().await;
+    let records = Arc::new(MemoryRecordStore::new());
+    let running = start(
+        &hub,
+        "node-legacy-group-status",
+        Backend::Memory(records.clone()),
+        false,
+    )
+    .await;
+    let generation = running.node.session(SESSION).unwrap().generation;
+    let mut receive = encrypted(
+        &hub,
+        "node-legacy-group-status",
+        &running,
+        wa::Message {
+            group_status_message_v2: wa::message::FutureProofMessage {
+                message: wa::Message {
+                    conversation: Some("application-private-text".into()),
+                    ..Default::default()
+                }
+                .into(),
+            }
+            .into(),
+            ..Default::default()
+        },
+        false,
+    )
+    .await;
+    receive.chat = "120363000000001@g.us".into();
+    let invalid_scope = hub
+        .command(
+            "node-legacy-group-status",
+            generation,
+            Op::StatusReceive(proto::StatusReceive {
+                payload: Some(receive.clone()),
+                status_kind: "personal".into(),
+                status_session: true,
+            }),
+        )
+        .await;
+    assert!(
+        matches!(invalid_scope.body, Some(Body::Error(proto::Error {code, ..})) if code == proto::Code::InvalidArgument as i32)
+    );
+    assert!(
+        records
+            .scan_keys(SESSION, Namespace::Session, "", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let client = reqwest::Client::new();
+    let url = format!("http://{}", running.http_addr);
+    let mut stream = client
+        .get(format!("{url}/v1/events"))
+        .bearer_auth(APP_SECRET)
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let command = hub.command(
+        "node-legacy-group-status",
+        generation,
+        Op::Receive(receive.clone()),
+    );
+    let app = async {
+        let event = next_event(&mut stream).await;
+        assert_eq!(event["text"], "application-private-text");
+        assert_eq!(event["type"], "status.received");
+        assert_eq!(event["status_scope"], "group");
+        assert!(!event["redelivered"].as_bool().unwrap());
+        assert_eq!(
+            client
+                .post(format!(
+                    "{url}/v1/events/{}/ack",
+                    event["id"].as_str().unwrap()
+                ))
+                .bearer_auth(APP_SECRET)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        event
+    };
+    let (response, event) = tokio::join!(command, app);
+    assert!(matches!(
+        response.body,
+        Some(Body::ServiceResponse(proto::ServiceResponse {
+            result: Some(Out::Receive(proto::ReceiveResult {
+                already_delivered: false,
+                status_kind: ref classification,
+                ..
+            }))
+        })) if classification == "group"
+    ));
+    let again = hub
+        .command("node-legacy-group-status", generation, Op::Receive(receive))
+        .await;
+    assert!(matches!(
+        again.body,
+        Some(Body::ServiceResponse(proto::ServiceResponse {
+            result: Some(Out::Receive(proto::ReceiveResult {
+                already_delivered: true,
+                status_kind: ref classification,
+                ..
+            }))
+        })) if classification == "group"
+    ));
+    for ns in Namespace::ALL {
+        for key in records.scan_keys(SESSION, ns, "", None).await.unwrap() {
+            let value = records.get(SESSION, ns, &key).await.unwrap().unwrap();
+            assert!(
+                !value
+                    .windows(b"application-private-text".len())
+                    .any(|part| part == b"application-private-text")
+            );
+        }
+    }
+    assert_eq!(
+        client
+            .post(format!(
+                "{url}/v1/events/{}/ack",
+                event["id"].as_str().unwrap()
+            ))
+            .bearer_auth(APP_SECRET)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    drop(stream);
+    running.shutdown().await;
+}

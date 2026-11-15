@@ -297,7 +297,10 @@ async fn receive(
         error
     })?;
     let message = match received {
-        Received::AlreadyDelivered { receipt_key } => {
+        Received::AlreadyDelivered {
+            receipt_key,
+            group_status_wrapper,
+        } => {
             let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
                 let cutoff = crate::node::now_ms()
                     .saturating_sub(node.cfg.decrypt_buffer_retention.as_millis() as u64);
@@ -315,6 +318,13 @@ async fn receive(
                 ));
             }
             return respond(Out::Receive(ReceiveResult {
+                status_kind: publication_kind(
+                    &receive,
+                    status_kind,
+                    group_status_wrapper == Some(true),
+                )
+                .unwrap_or("")
+                .to_owned(),
                 already_delivered: true,
                 app_state_key_share,
                 ..Default::default()
@@ -322,6 +332,12 @@ async fn receive(
         }
         Received::Message(message) => message,
     };
+
+    let status_kind = publication_kind(
+        &receive,
+        status_kind,
+        message.content.message.group_status_message_v2.is_set(),
+    );
 
     // Explicit operator consent in addition to the pinned core own-device gate.
     let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
@@ -364,6 +380,7 @@ async fn receive(
         .await
         .map_err(|e| node.ops_error(session, &e))?;
     respond(Out::Receive(ReceiveResult {
+        status_kind: status_kind.unwrap_or("").to_owned(),
         already_delivered: false,
         redelivered: message.redelivered,
         sender_key_rejected: message.sender_key_rejected,
@@ -374,6 +391,16 @@ async fn receive(
 /// The application event for a received message, or `None` when the
 /// message is protocol-only (sender keys, app-state keys, peer data
 /// operations) or is history and history delivery is off.
+fn publication_kind<'a>(
+    receive: &proto::Receive,
+    explicit: Option<&'a str>,
+    group_wrapper: bool,
+) -> Option<&'a str> {
+    explicit
+        .or_else(|| (receive.chat.ends_with("@g.us") && group_wrapper).then_some("group"))
+        .or_else(|| (receive.chat == "status@broadcast").then_some("personal"))
+}
+
 fn event_for(
     node: &Node,
     session: &ActiveSession,
@@ -385,12 +412,11 @@ fn event_for(
     if content.is_skdm_only {
         return None;
     }
-    let status_kind = status_kind
-        .or_else(|| {
-            (receive.chat.ends_with("@g.us") && content.message.group_status_message_v2.is_set())
-                .then_some("group")
-        })
-        .or_else(|| (receive.chat == "status@broadcast").then_some("personal"));
+    let status_kind = publication_kind(
+        receive,
+        status_kind,
+        content.message.group_status_message_v2.is_set(),
+    );
     let base = |kind: &'static str| Event {
         id: received.receipt_key.clone(),
         kind,

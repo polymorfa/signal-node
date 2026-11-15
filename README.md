@@ -178,3 +178,8 @@ The receiver delivers `status.received` with `status_scope` and the existing sha
 content fields. Group publications retain their full protobuf while text and
 media use the wrapped publication content. Replies and mention notifications
 remain messages. Local synthetic tests do not establish live rollout eligibility.
+
+Legacy group publication wrappers also return their classification for delivery
+receipts, including after application acknowledgment. Delivered markers retain
+only that classification, not plaintext. Empty markers written by older versions
+have unknown classification; no sender or publication scope is guessed from them.

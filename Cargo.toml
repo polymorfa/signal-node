@@ -18,11 +18,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Signal core, pinned to polymorfa/whatsapp-rust branch polymorfa/recordstore.
-wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc" }
-wacore-binary = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc" }
-wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc" }
-wacore-signal-ops = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc" }
-waproto = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc" }
+wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e" }
+wacore-binary = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e" }
+wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e" }
+wacore-signal-ops = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e" }
+waproto = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e" }
 
 aes-gcm = "0.10"
 anyhow = "1"
@@ -55,7 +55,7 @@ protox = "0.9"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc", features = ["test-util"] }
+wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e", features = ["test-util"] }
 rand10 = { package = "rand", version = "0.10" }
-wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "90df5a8728e23afe2331bf9c26a74f7318c5a8dc", features = ["conformance"] }
+wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "71525d8f0a4ada89560b95a9156b3d17d7d8414e", features = ["conformance"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

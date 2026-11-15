@@ -230,6 +230,8 @@ message StatusReceive {
 }
 
 message ReceiveResult {
+  // Decrypted publication context for receipts. Empty when unknown.
+  string status_kind = 5;
   bool already_delivered = 1;
   bool redelivered = 2;
   bool sender_key_rejected = 3;
