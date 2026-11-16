@@ -166,8 +166,9 @@ message Error {
     CODE_RATE_LIMITED = 7;
     // The session is not paired, logged out, or not in this project.
     CODE_SESSION_UNAVAILABLE = 8;
-    // The operation is refused for zero-knowledge sessions (for example a
-    // Campaign send).
+    // The operation is refused: for zero-knowledge sessions (for example a
+    // Campaign send), or because a recipient device's identity did not verify
+    // against its account.
     CODE_REFUSED = 9;
   }
   Code code = 1;

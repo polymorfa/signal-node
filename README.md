@@ -9,7 +9,7 @@ This repository is private. The implementation is under review and has not been 
 - Runner protocol: [`proto/polymorfa/signal/v1/signal_service.proto`](proto/polymorfa/signal/v1/signal_service.proto), version `1`, subprotocol `polymorfa.signal.v1`, originating at `b6d5f5f`.
 - Application API: [`docs/app-api.openapi.json`](docs/app-api.openapi.json). JSON field names use snake_case. Event and message timestamps use Unix seconds; lease expiry uses Unix milliseconds internally.
 - Signal libraries: exact `polymorfa/whatsapp-rust` revision `4b3b13cacd40a27573d0246386db553ef887539b`, the unmerged [recordstore/Signal operations producer PR](https://github.com/polymorfa/whatsapp-rust/pull/5). All five normal/dev crate families use this same source. A successful local build does not make that producer a released dependency.
-- Rust MSRV: `1.94`. The checked-in toolchain selects `1.94.0`.
+- Rust MSRV: `1.95`. The checked-in toolchain selects `1.95.0`.
 
 The server connection uses a project credential in `Authorization`, never in a URL or browser. The local API uses a separate application bearer secret. It rejects every authenticated request with an `Origin` header, including `Origin: null`, and supplies no CORS permission. Browser/WASM remote transport is unavailable until Polymorfa provides a distinct, short-lived client grant backed by live authorization. Never put the project credential or application secret in a browser.
 
@@ -23,7 +23,7 @@ Upgrade the supporting service before a runner requires these operations. An old
 
 ## Run
 
-Build the binary with Rust 1.94 or newer:
+Build the binary with Rust 1.95 or newer:
 
 ```sh
 cargo build --release --locked

@@ -2,7 +2,7 @@
 name = "signal-node"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version.workspace = true
 license = "AGPL-3.0-only"
 description = "Self-hosted Signal service for Polymorfa zero-knowledge sessions"
 repository = "https://github.com/polymorfa/signal-node"
@@ -17,12 +17,13 @@ name = "signal-node"
 path = "src/main.rs"
 
 [dependencies]
-# Signal core, pinned to polymorfa/whatsapp-rust branch polymorfa/recordstore.
-wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b" }
-wacore-binary = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b" }
-wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b" }
-wacore-signal-ops = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b" }
-waproto = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b" }
+# Signal core from oxidezap/whatsapp-rust, plus this service's own Signal
+# operations and sealed record store, which build on its public API.
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+wacore-recordstore = { path = "crates/recordstore" }
+wacore-signal-ops = { path = "crates/signal-ops" }
+waproto = { workspace = true }
 
 aes-gcm = "0.10"
 anyhow = "1"
@@ -55,7 +56,34 @@ protox = "0.9"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-wacore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b", features = ["test-util"] }
+wacore = { workspace = true, features = ["test-util"] }
 rand10 = { package = "rand", version = "0.10" }
-wacore-recordstore = { git = "https://github.com/polymorfa/whatsapp-rust", rev = "4b3b13cacd40a27573d0246386db553ef887539b", features = ["conformance"] }
+wacore-recordstore = { path = "crates/recordstore", features = ["conformance"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+[workspace]
+resolver = "3"
+members = [".", "crates/recordstore", "crates/signal-ops"]
+
+[workspace.package]
+rust-version = "1.95"
+
+[workspace.dependencies]
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "2671430db6161c01c507587d0e3c90dcf153aa85" }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "2671430db6161c01c507587d0e3c90dcf153aa85" }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "2671430db6161c01c507587d0e3c90dcf153aa85" }
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
+anyhow = { version = "1.0", default-features = false }
+async-lock = { version = "3", default-features = false }
+async-trait = "0.1.91"
+buffa = { version = "0.9.2", default-features = false, features = ["json"] }
+bytes = { version = "1.12", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+hmac = { version = "0.13.0", default-features = false }
+rand = "0.10"
+sha2 = { version = "0.11.0", default-features = false }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", default-features = false }
+log = "0.4"
+serde = { version = "1.0", features = ["derive", "rc"] }

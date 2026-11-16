@@ -13,7 +13,7 @@ use crate::proto::{
     PreKeys, ReceiveResult, ServiceResponse, SignedPairing, Stanza, runner_request::Op,
     service_response::Result as Out,
 };
-use crate::resolver::{RemoteResolver, remote_bundle};
+use crate::resolver::{RemoteResolver, TokioRuntime, remote_bundle};
 use std::sync::Arc;
 use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::types::jid::JidExt as _;
@@ -71,7 +71,10 @@ pub async fn handle(
         Op::GetIdentity(_) => unreachable!("handled above"),
         Op::Receive(receive) => self::receive(node, session, &ops, receive).await,
         Op::GeneratePreKeys(request) => {
-            let keys = ops.generate_prekeys(request.count).await.map_err(fail)?;
+            let keys = ops
+                .generate_prekeys(&TokioRuntime, request.count)
+                .await
+                .map_err(fail)?;
             respond(Out::PreKeys(PreKeys {
                 pre_keys: keys
                     .into_iter()
@@ -90,7 +93,7 @@ pub async fn handle(
         }
         Op::PreparePreKeyUpload(request) => {
             let batch = ops
-                .prepare_prekey_upload(request.count)
+                .prepare_prekey_upload(&TokioRuntime, request.count)
                 .await
                 .map_err(fail)?;
             respond(Out::PreKeyUploadBatch(PreKeyUploadBatch {
@@ -189,6 +192,10 @@ pub async fn handle(
         Op::ForgetIdentity(request) => {
             let user = jid(&request.user, "user")?;
             ops.forget_user(&user).await.map_err(fail)?;
+            // Polymorfa is trusted to report identity changes (README), so
+            // its report also releases the account's pin: the next primary
+            // identity seen is pinned in its place.
+            ops.forget_account_identity(&user).await.map_err(fail)?;
             respond(Out::Ok(proto::Ok {}))
         }
         Op::MigratePnToLid(request) => {
@@ -255,6 +262,8 @@ async fn receive(
             ciphertext: &receive.ciphertext,
             padding_version,
             is_from_me: receive.is_from_me,
+            device_identity: (!receive.device_identity.is_empty())
+                .then_some(receive.device_identity.as_slice()),
         })
         .await
         .map_err(|e| {
