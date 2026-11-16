@@ -85,7 +85,7 @@ Events contain a stable `id`, `type`, `session_id`, routing metadata, `message_i
 A receive that produces an application event succeeds only after one application acknowledgment. With both channels enabled, the first successful webhook or SSE acknowledgment wins.
 
 - Webhook: any `2xx` response acknowledges the event. Persist/deduplicate the event before responding. Non-`2xx`, redirects, timeouts and connection failures do not acknowledge it.
-- SSE: persist/deduplicate the event, then POST its `id` to the ACK route. Multiple subscribers receive the same event; one acknowledgment completes all pending receives for that ID. Keep authorization headers on the stream and ACK request.
+- SSE: persist/deduplicate the event, then POST its `id` to the ACK route. Multiple subscribers receive the same event; one acknowledgment completes all pending receives for that ID. IDs are unique per session: two sessions that receive the same group message get different IDs. Keep authorization headers on the stream and ACK request.
 
 The webhook signs the exact request body bytes. Headers are `Signal-Node-Timestamp` (Unix seconds), `Signal-Node-Event-Id`, and `Signal-Node-Signature: v1=<hex HMAC-SHA256>`. The signed bytes are `timestamp + "." + rawBody`. Verify the MAC in constant time and reject timestamps outside a bounded window, such as five minutes, before parsing or processing. The Rust helpers `delivery::verify` and `delivery::verify_recent` implement the MAC and timestamp checks. Deduplicate by event ID in durable application storage; a valid signature alone does not prevent replay.
 
