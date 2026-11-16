@@ -250,6 +250,17 @@ fn sender_key_device_key(group: &str, device: &Jid) -> String {
     format!("{group}\u{0}{device}")
 }
 
+/// A device known to hold this group's current sender key. Unlike the
+/// distribution mark beside it, a retry never clears it: only rotating the
+/// key does, so a holder that leaves is always detected.
+fn sender_key_holder_key(group: &str, device: &Jid) -> String {
+    format!("{group}\u{2}{device}")
+}
+
+fn sender_key_holder_prefix(group: &str) -> String {
+    format!("{group}\u{2}")
+}
+
 /// A group's sender-key epoch. It sits outside the `{group}\0` device
 /// prefix, so clearing the distribution marks on rotation leaves it in place.
 fn distribution_epoch_key(group: &str) -> String {
@@ -689,32 +700,35 @@ impl<S: ServiceStore> SignalOps<S> {
                     // A device that holds the current key but is no longer
                     // addressed left the group (or unlinked): rotate, so it
                     // cannot read later messages on this chain.
-                    let marks = self
+                    let holders = self
                         .store()
-                        .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
+                        .scan_aux(
+                            Namespace::SenderKeyDevices,
+                            &sender_key_holder_prefix(&group_str),
+                        )
                         .await?;
-                    let addressed_marks: HashSet<String> = addressed
+                    let addressed_holders: HashSet<String> = addressed
                         .devices()
                         .iter()
-                        .map(|device| sender_key_device_key(&group_str, device))
+                        .map(|device| sender_key_holder_key(&group_str, device))
                         .collect();
                     let addressed_users: HashSet<&str> = addressed
                         .devices()
                         .iter()
                         .map(|device| device.user.as_str())
                         .collect();
-                    let mark_prefix = format!("{group_str}\u{0}");
+                    let holder_prefix = sender_key_holder_prefix(&group_str);
                     let removed = !force
                         && !chain_changed
-                        && marks.iter().any(|mark| {
-                            if addressed_marks.contains(mark) {
+                        && holders.iter().any(|holder| {
+                            if addressed_holders.contains(holder) {
                                 return false;
                             }
                             // A companion's primary is marked with it (see the
                             // warm check below) even when the server lists only
                             // the companion; that account has not left.
-                            match mark
-                                .strip_prefix(&mark_prefix)
+                            match holder
+                                .strip_prefix(&holder_prefix)
                                 .and_then(|device| device.parse::<Jid>().ok())
                             {
                                 Some(device) => {
@@ -764,9 +778,17 @@ impl<S: ServiceStore> SignalOps<S> {
                         }
                     }
                     if chain_changed || removed {
-                        let marks = staged
+                        let mut marks = staged
                             .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
                             .await?;
+                        marks.extend(
+                            staged
+                                .scan_aux(
+                                    Namespace::SenderKeyDevices,
+                                    &sender_key_holder_prefix(&group_str),
+                                )
+                                .await?,
+                        );
                         let refs: Vec<&str> = marks.iter().map(String::as_str).collect();
                         staged
                             .delete_aux(Namespace::SenderKeyDevices, &refs)
@@ -915,6 +937,13 @@ impl<S: ServiceStore> SignalOps<S> {
                         &[1],
                     )
                     .await?;
+                self.store()
+                    .put_aux(
+                        Namespace::SenderKeyDevices,
+                        &sender_key_holder_key(&group_str, device),
+                        &[1],
+                    )
+                    .await?;
             }
             Ok(true)
         })
@@ -945,9 +974,17 @@ impl<S: ServiceStore> SignalOps<S> {
                 staged.delete_sender_key(name.cache_key()).await?;
             }
             let prefix = format!("{group}\u{0}");
-            let keys = staged
+            let mut keys = staged
                 .scan_aux(Namespace::SenderKeyDevices, &prefix)
                 .await?;
+            keys.extend(
+                staged
+                    .scan_aux(
+                        Namespace::SenderKeyDevices,
+                        &sender_key_holder_prefix(&group_str),
+                    )
+                    .await?,
+            );
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
             staged
                 .delete_aux(Namespace::SenderKeyDevices, &refs)

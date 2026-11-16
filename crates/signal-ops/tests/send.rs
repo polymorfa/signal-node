@@ -865,6 +865,27 @@ async fn a_send_after_a_participant_is_removed_rotates_the_sender_key() {
             .unwrap()
     );
 
+    // Bob asks for a retry first, which clears his distribution mark so a
+    // later send would redistribute to him. That must not hide that he still
+    // holds the current key.
+    alice
+        .resend(
+            &client,
+            wacore_signal_ops::RetryRequest {
+                chat: &group,
+                message_id: "BEFORE",
+                requester: &bob_jid,
+                encryption_jid: &bob_jid,
+                route: wacore_signal_ops::RetryRoute::Group {
+                    addressing_mode: AddressingMode::Pn,
+                },
+                retry_count: 1,
+                bundle: None,
+            },
+        )
+        .await
+        .unwrap();
+
     // Bob leaves. Nothing calls forget_sender_key_devices: the next send
     // has to notice that a device holding the key is no longer addressed.
     {
@@ -879,9 +900,11 @@ async fn a_send_after_a_participant_is_removed_rotates_the_sender_key() {
         .send_group(&TokioRuntime, &client, &group, &text("after"), "AFTER")
         .await
         .unwrap();
-    assert_ne!(
-        after.distribution_epoch, first.distribution_epoch,
-        "removing a participant starts a new distribution epoch"
+    // The retry already started an epoch of its own, so compare chains: the
+    // remaining member must be sent a fresh sender key.
+    assert!(
+        after.distribution_targets.contains(&carol_jid),
+        "removing a participant must redistribute a new key to the others"
     );
     assert!(pairwise_enc_for(&after.stanza, &bob_jid).is_none());
     assert!(
