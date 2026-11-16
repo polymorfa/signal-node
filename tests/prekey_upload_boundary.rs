@@ -273,6 +273,7 @@ async fn consume_pending(
                 signed_pre_key: identity.signed_pre_key,
                 signed_pre_key_signature: identity.signed_pre_key_signature,
                 pre_key: Some(batch.pre_keys[0].clone()),
+                device_identity: Vec::new(),
             })
             .unwrap(),
         )
@@ -306,6 +307,7 @@ async fn consume_pending(
         is_from_me: false,
         timestamp: 1720000000,
         sender_alt: String::new(),
+        device_identity: Vec::new(),
     };
     let delivery = hub.request(name, request(scope, generation, Op::Receive(receive)));
     let app = async {

@@ -474,6 +474,7 @@ pub async fn peer(
             id: pre.id,
             public_key: pre.public_key.to_vec(),
         }),
+        device_identity: Vec::new(),
     };
     (ops, bundle)
 }

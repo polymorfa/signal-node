@@ -54,6 +54,7 @@ async fn encrypted(
         signed_pre_key: identity.signed_pre_key,
         signed_pre_key_signature: identity.signed_pre_key_signature,
         pre_key: Some(keys.pre_keys[0].clone()),
+        device_identity: Vec::new(),
     };
     let bob: wacore_binary::Jid = "222:1@s.whatsapp.net".parse().unwrap();
     peer.establish_session(
@@ -81,6 +82,7 @@ async fn encrypted(
         is_from_me: from_me,
         timestamp: 1720000000,
         sender_alt: String::new(),
+        device_identity: Vec::new(),
     }
 }
 async fn next_event<S>(stream: &mut S) -> Value
