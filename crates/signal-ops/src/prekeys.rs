@@ -69,7 +69,9 @@ impl PreKeyUploadBatch {
         }
         let mut seen = BTreeSet::new();
         let mut pre_keys = Vec::with_capacity(count);
-        for entry in bytes[HEADER..data_len].chunks_exact(ENTRY) {
+        // data_len is HEADER plus whole entries, so there is no remainder.
+        let (entries, _) = bytes[HEADER..data_len].as_chunks::<ENTRY>();
+        for entry in entries {
             let id = u32::from_be_bytes(entry[..4].try_into().map_err(|_| corrupt())?);
             if !(1..=MAX_PREKEY_ID).contains(&id) || !seen.insert(id) {
                 return Err(corrupt());
