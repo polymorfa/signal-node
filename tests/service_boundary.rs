@@ -1418,6 +1418,7 @@ async fn encrypted_status_uses_scoped_session_and_separate_publication_event() {
         assert_eq!(event["type"], "status.received");
         assert_eq!(event["status_scope"], "personal");
         assert!(!event["redelivered"].as_bool().unwrap());
+        assert_status_records_sealed(&records).await;
         assert_eq!(
             client
                 .post(format!(
@@ -1463,16 +1464,7 @@ async fn encrypted_status_uses_scoped_session_and_separate_publication_event() {
             }))
         }))
     ));
-    for ns in Namespace::ALL {
-        for key in records.scan_keys(SESSION, ns, "", None).await.unwrap() {
-            let value = records.get(SESSION, ns, &key).await.unwrap().unwrap();
-            assert!(
-                !value
-                    .windows(b"application-private-text".len())
-                    .any(|part| part == b"application-private-text")
-            );
-        }
-    }
+    assert_status_records_sealed(&records).await;
     assert_eq!(
         client
             .post(format!(
@@ -1562,6 +1554,7 @@ async fn legacy_group_publication_classification_survives_duplicate_delivery() {
         assert_eq!(event["type"], "status.received");
         assert_eq!(event["status_scope"], "group");
         assert!(!event["redelivered"].as_bool().unwrap());
+        assert_status_records_sealed(&records).await;
         assert_eq!(
             client
                 .post(format!(
@@ -1601,16 +1594,7 @@ async fn legacy_group_publication_classification_survives_duplicate_delivery() {
             }))
         })) if classification == "group"
     ));
-    for ns in Namespace::ALL {
-        for key in records.scan_keys(SESSION, ns, "", None).await.unwrap() {
-            let value = records.get(SESSION, ns, &key).await.unwrap().unwrap();
-            assert!(
-                !value
-                    .windows(b"application-private-text".len())
-                    .any(|part| part == b"application-private-text")
-            );
-        }
-    }
+    assert_status_records_sealed(&records).await;
     assert_eq!(
         client
             .post(format!(
@@ -1626,4 +1610,17 @@ async fn legacy_group_publication_classification_survives_duplicate_delivery() {
     );
     drop(stream);
     running.shutdown().await;
+}
+
+async fn assert_status_records_sealed(records: &MemoryRecordStore) {
+    for ns in Namespace::ALL {
+        for key in records.scan_keys(SESSION, ns, "", None).await.unwrap() {
+            let value = records.get(SESSION, ns, &key).await.unwrap().unwrap();
+            assert!(
+                !value
+                    .windows(b"application-private-text".len())
+                    .any(|part| part == b"application-private-text")
+            );
+        }
+    }
 }
