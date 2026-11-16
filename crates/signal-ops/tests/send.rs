@@ -800,6 +800,123 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
 }
 
 #[tokio::test]
+async fn a_send_after_a_participant_is_removed_rotates_the_sender_key() {
+    use wacore::types::message::AddressingMode;
+    let group: Jid = "54321@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let carol_jid: Jid = "333@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-removal-rotation",
+        &alice_jid.to_string(),
+        Some("900111:1@lid"),
+    )
+    .await;
+    let bob = device("bob-removal-rotation", &bob_jid.to_string()).await;
+    let carol = device("carol-removal-rotation", &carol_jid.to_string()).await;
+    let alice_paired = common::pair(&alice).await;
+    for peer in [&bob, &carol] {
+        peer.trust_account_identity(&alice_jid, alice_paired.account)
+            .await
+            .unwrap();
+    }
+    let identity = alice_paired.device_identity.clone();
+    let client = ChangingGroupClient::new(
+        FakeClient {
+            devices: vec![alice_jid.clone(), bob_jid.clone(), carol_jid.clone()],
+            bundles: HashMap::from([
+                (bob_jid.clone(), bundle_for(&bob).await),
+                (carol_jid.clone(), bundle_for(&carol).await),
+            ]),
+            device_identities: HashMap::new(),
+            group: Some(Arc::new(GroupRoutingInfo::new(
+                vec![alice_jid.to_non_ad(), bob_jid.clone(), carol_jid.clone()],
+                AddressingMode::Pn,
+            ))),
+        },
+        false,
+    );
+    let first = alice
+        .send_group(&TokioRuntime, &client, &group, &text("before"), "BEFORE")
+        .await
+        .unwrap();
+    for (peer, jid) in [(&bob, &bob_jid), (&carol, &carol_jid)] {
+        receive_group_component(
+            peer,
+            &group,
+            &alice_jid,
+            &identity,
+            enc_for(&first.stanza, jid),
+        )
+        .await
+        .unwrap();
+        receive_group_component(peer, &group, &alice_jid, &identity, skmsg_of(&first.stanza))
+            .await
+            .unwrap();
+    }
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &first.distribution_targets,
+                first.distribution_epoch
+            )
+            .await
+            .unwrap()
+    );
+
+    // Bob leaves. Nothing calls forget_sender_key_devices: the next send
+    // has to notice that a device holding the key is no longer addressed.
+    {
+        let mut current = client.current.write().unwrap();
+        current.devices = vec![alice_jid.clone(), carol_jid.clone()];
+        current.group = Some(Arc::new(GroupRoutingInfo::new(
+            vec![alice_jid.to_non_ad(), carol_jid.clone()],
+            AddressingMode::Pn,
+        )));
+    }
+    let after = alice
+        .send_group(&TokioRuntime, &client, &group, &text("after"), "AFTER")
+        .await
+        .unwrap();
+    assert_ne!(
+        after.distribution_epoch, first.distribution_epoch,
+        "removing a participant starts a new distribution epoch"
+    );
+    assert!(pairwise_enc_for(&after.stanza, &bob_jid).is_none());
+    assert!(
+        receive_group_component(&bob, &group, &alice_jid, &identity, skmsg_of(&after.stanza))
+            .await
+            .is_err(),
+        "a removed participant can still read the group on the old sender key"
+    );
+    receive_group_component(
+        &carol,
+        &group,
+        &alice_jid,
+        &identity,
+        enc_for(&after.stanza, &carol_jid),
+    )
+    .await
+    .unwrap();
+    let Received::Message(message) = receive_group_component(
+        &carol,
+        &group,
+        &alice_jid,
+        &identity,
+        skmsg_of(&after.stanza),
+    )
+    .await
+    .unwrap() else {
+        panic!("the remaining participant did not receive the message")
+    };
+    assert_eq!(
+        message.content.message.conversation.as_deref(),
+        Some("after")
+    );
+}
+
+#[tokio::test]
 async fn group_encryption_keeps_the_address_selected_before_session_locking() {
     use wacore::types::message::AddressingMode;
     let group: Jid = "12345@g.us".parse().unwrap();

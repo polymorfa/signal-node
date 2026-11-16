@@ -686,7 +686,47 @@ impl<S: ServiceStore> SignalOps<S> {
                         .await?
                         .as_deref()
                         != Some(own_chain.sender_id().as_bytes());
-                    let targets = if force || chain_changed {
+                    // A device that holds the current key but is no longer
+                    // addressed left the group (or unlinked): rotate, so it
+                    // cannot read later messages on this chain.
+                    let marks = self
+                        .store()
+                        .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
+                        .await?;
+                    let addressed_marks: HashSet<String> = addressed
+                        .devices()
+                        .iter()
+                        .map(|device| sender_key_device_key(&group_str, device))
+                        .collect();
+                    let addressed_users: HashSet<&str> = addressed
+                        .devices()
+                        .iter()
+                        .map(|device| device.user.as_str())
+                        .collect();
+                    let mark_prefix = format!("{group_str}\u{0}");
+                    let removed = !force
+                        && !chain_changed
+                        && marks.iter().any(|mark| {
+                            if addressed_marks.contains(mark) {
+                                return false;
+                            }
+                            // A companion's primary is marked with it (see the
+                            // warm check below) even when the server lists only
+                            // the companion; that account has not left.
+                            match mark
+                                .strip_prefix(&mark_prefix)
+                                .and_then(|device| device.parse::<Jid>().ok())
+                            {
+                                Some(device) => {
+                                    !(device.device == 0
+                                        && addressed_users.contains(device.user.as_str()))
+                                }
+                                // An unreadable mark proves nothing either way;
+                                // rotating is the safe choice.
+                                None => true,
+                            }
+                        });
+                    let targets = if force || chain_changed || removed {
                         let mut all = addressed.devices().to_vec();
                         retain_skdm_distribution_targets(&mut all, own_sending);
                         all
@@ -714,7 +754,16 @@ impl<S: ServiceStore> SignalOps<S> {
                     };
 
                     let staged = std::sync::Arc::new(self.store().staged());
-                    if chain_changed {
+                    if removed {
+                        for own in [&own_jid, &own_lid] {
+                            let name = SenderKeyName::from_parts(
+                                &group_str,
+                                own.to_protocol_address().as_str(),
+                            );
+                            staged.delete_sender_key(name.cache_key()).await?;
+                        }
+                    }
+                    if chain_changed || removed {
                         let marks = staged
                             .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
                             .await?;
@@ -774,7 +823,7 @@ impl<S: ServiceStore> SignalOps<S> {
                             to: group,
                             message,
                             message_id,
-                            force_distribution: force,
+                            force_distribution: force || removed,
                             distribution_targets: Some(targets),
                             distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                             phash_devices: Some(&addressed),
