@@ -283,10 +283,9 @@ pub fn build_message(request: &SendRequest, now_secs: i64) -> Result<wa::Message
             if text.is_empty() {
                 return Err(BuildError::EmptyText);
             }
-            Ok(wa::Message {
-                conversation: Some(text.clone()),
-                ..Default::default()
-            })
+            let mut message = wa::Message::default();
+            message.conversation = Some(text.clone());
+            Ok(message)
         }
         (None, Some(media)) => build_media(media, now_secs),
         _ => Err(BuildError::NeedOneBody),
@@ -310,85 +309,90 @@ fn build_media(d: &MediaDescriptor, now_secs: i64) -> Result<wa::Message, BuildE
     let mut message = wa::Message::default();
     match d.kind.as_str() {
         "image" => {
-            message.image_message = wa::message::ImageMessage {
-                url: d.url.clone(),
-                direct_path: Some(d.direct_path.clone()),
-                media_key: Some(media_key),
-                file_sha256: Some(file_sha256),
-                file_enc_sha256: Some(file_enc_sha256),
-                file_length: Some(d.file_length),
-                mimetype: Some(d.mimetype.clone()),
-                caption: d.caption.clone(),
-                width: d.width,
-                height: d.height,
-                media_key_timestamp: ts,
-                ..Default::default()
+            message.image_message = {
+                let mut inner = wa::message::ImageMessage::default();
+                inner.url = d.url.clone();
+                inner.direct_path = Some(d.direct_path.clone());
+                inner.media_key = Some(media_key);
+                inner.file_sha256 = Some(file_sha256);
+                inner.file_enc_sha256 = Some(file_enc_sha256);
+                inner.file_length = Some(d.file_length);
+                inner.mimetype = Some(d.mimetype.clone());
+                inner.caption = d.caption.clone();
+                inner.width = d.width;
+                inner.height = d.height;
+                inner.media_key_timestamp = ts;
+                inner
             }
             .into();
         }
         "video" => {
-            message.video_message = wa::message::VideoMessage {
-                url: d.url.clone(),
-                direct_path: Some(d.direct_path.clone()),
-                media_key: Some(media_key),
-                file_sha256: Some(file_sha256),
-                file_enc_sha256: Some(file_enc_sha256),
-                file_length: Some(d.file_length),
-                mimetype: Some(d.mimetype.clone()),
-                caption: d.caption.clone(),
-                width: d.width,
-                height: d.height,
-                seconds: d.seconds,
-                media_key_timestamp: ts,
-                ..Default::default()
+            message.video_message = {
+                let mut inner = wa::message::VideoMessage::default();
+                inner.url = d.url.clone();
+                inner.direct_path = Some(d.direct_path.clone());
+                inner.media_key = Some(media_key);
+                inner.file_sha256 = Some(file_sha256);
+                inner.file_enc_sha256 = Some(file_enc_sha256);
+                inner.file_length = Some(d.file_length);
+                inner.mimetype = Some(d.mimetype.clone());
+                inner.caption = d.caption.clone();
+                inner.width = d.width;
+                inner.height = d.height;
+                inner.seconds = d.seconds;
+                inner.media_key_timestamp = ts;
+                inner
             }
             .into();
         }
         "audio" => {
-            message.audio_message = wa::message::AudioMessage {
-                url: d.url.clone(),
-                direct_path: Some(d.direct_path.clone()),
-                media_key: Some(media_key),
-                file_sha256: Some(file_sha256),
-                file_enc_sha256: Some(file_enc_sha256),
-                file_length: Some(d.file_length),
-                mimetype: Some(d.mimetype.clone()),
-                seconds: d.seconds,
-                ptt: d.ptt,
-                media_key_timestamp: ts,
-                ..Default::default()
+            message.audio_message = {
+                let mut inner = wa::message::AudioMessage::default();
+                inner.url = d.url.clone();
+                inner.direct_path = Some(d.direct_path.clone());
+                inner.media_key = Some(media_key);
+                inner.file_sha256 = Some(file_sha256);
+                inner.file_enc_sha256 = Some(file_enc_sha256);
+                inner.file_length = Some(d.file_length);
+                inner.mimetype = Some(d.mimetype.clone());
+                inner.seconds = d.seconds;
+                inner.ptt = d.ptt;
+                inner.media_key_timestamp = ts;
+                inner
             }
             .into();
         }
         "document" => {
-            message.document_message = wa::message::DocumentMessage {
-                url: d.url.clone(),
-                direct_path: Some(d.direct_path.clone()),
-                media_key: Some(media_key),
-                file_sha256: Some(file_sha256),
-                file_enc_sha256: Some(file_enc_sha256),
-                file_length: Some(d.file_length),
-                mimetype: Some(d.mimetype.clone()),
-                caption: d.caption.clone(),
-                file_name: d.file_name.clone(),
-                media_key_timestamp: ts,
-                ..Default::default()
+            message.document_message = {
+                let mut inner = wa::message::DocumentMessage::default();
+                inner.url = d.url.clone();
+                inner.direct_path = Some(d.direct_path.clone());
+                inner.media_key = Some(media_key);
+                inner.file_sha256 = Some(file_sha256);
+                inner.file_enc_sha256 = Some(file_enc_sha256);
+                inner.file_length = Some(d.file_length);
+                inner.mimetype = Some(d.mimetype.clone());
+                inner.caption = d.caption.clone();
+                inner.file_name = d.file_name.clone();
+                inner.media_key_timestamp = ts;
+                inner
             }
             .into();
         }
         "sticker" => {
-            message.sticker_message = wa::message::StickerMessage {
-                url: d.url.clone(),
-                direct_path: Some(d.direct_path.clone()),
-                media_key: Some(media_key),
-                file_sha256: Some(file_sha256),
-                file_enc_sha256: Some(file_enc_sha256),
-                file_length: Some(d.file_length),
-                mimetype: Some(d.mimetype.clone()),
-                width: d.width,
-                height: d.height,
-                media_key_timestamp: ts,
-                ..Default::default()
+            message.sticker_message = {
+                let mut inner = wa::message::StickerMessage::default();
+                inner.url = d.url.clone();
+                inner.direct_path = Some(d.direct_path.clone());
+                inner.media_key = Some(media_key);
+                inner.file_sha256 = Some(file_sha256);
+                inner.file_enc_sha256 = Some(file_enc_sha256);
+                inner.file_length = Some(d.file_length);
+                inner.mimetype = Some(d.mimetype.clone());
+                inner.width = d.width;
+                inner.height = d.height;
+                inner.media_key_timestamp = ts;
+                inner
             }
             .into();
         }

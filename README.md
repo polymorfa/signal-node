@@ -8,8 +8,8 @@ This repository is private. The implementation is under review and has not been 
 
 - Runner protocol: [`proto/polymorfa/signal/v1/signal_service.proto`](proto/polymorfa/signal/v1/signal_service.proto), version `1`, subprotocol `polymorfa.signal.v1`, originating at `b6d5f5f`.
 - Application API: [`docs/app-api.openapi.json`](docs/app-api.openapi.json). JSON field names use snake_case. Event and message timestamps use Unix seconds; lease expiry uses Unix milliseconds internally.
-- Signal libraries: exact `polymorfa/whatsapp-rust` revision `4b3b13cacd40a27573d0246386db553ef887539b`, the unmerged [recordstore/Signal operations producer PR](https://github.com/polymorfa/whatsapp-rust/pull/5). All five normal/dev crate families use this same source. A successful local build does not make that producer a released dependency.
-- Rust MSRV: `1.94`. The checked-in toolchain selects `1.94.0`.
+- Signal libraries: core from `oxidezap/whatsapp-rust` at `2671430db6161c01c507587d0e3c90dcf153aa85`, with `wacore-recordstore` and `wacore-signal-ops` owned by this workspace. Status-session storage and identity finalization live in the local operations adapter. Local checks do not establish a released service or native-client acceptance.
+- Rust MSRV: `1.95`. The checked-in toolchain selects `1.95.0`.
 
 The server connection uses a project credential in `Authorization`, never in a URL or browser. The local API uses a separate application bearer secret. It rejects every authenticated request with an `Origin` header, including `Origin: null`, and supplies no CORS permission. Browser/WASM remote transport is unavailable until Polymorfa provides a distinct, short-lived client grant backed by live authorization. Never put the project credential or application secret in a browser.
 
@@ -23,7 +23,7 @@ Upgrade the supporting service before a runner requires these operations. An old
 
 ## Run
 
-Build the binary with Rust 1.94 or newer:
+Build the binary with Rust 1.95 or newer:
 
 ```sh
 cargo build --release --locked
@@ -85,7 +85,7 @@ Events contain a stable `id`, `type`, `session_id`, routing metadata, `message_i
 A receive that produces an application event succeeds only after one application acknowledgment. With both channels enabled, the first successful webhook or SSE acknowledgment wins.
 
 - Webhook: any `2xx` response acknowledges the event. Persist/deduplicate the event before responding. Non-`2xx`, redirects, timeouts and connection failures do not acknowledge it.
-- SSE: persist/deduplicate the event, then POST its `id` to the ACK route. Multiple subscribers receive the same event; one acknowledgment completes all pending receives for that ID. Keep authorization headers on the stream and ACK request.
+- SSE: persist/deduplicate the event, then POST its `id` to the ACK route. Multiple subscribers receive the same event; one acknowledgment completes all pending receives for that ID. IDs are unique per session: two sessions that receive the same group message get different IDs. Keep authorization headers on the stream and ACK request.
 
 The webhook signs the exact request body bytes. Headers are `Signal-Node-Timestamp` (Unix seconds), `Signal-Node-Event-Id`, and `Signal-Node-Signature: v1=<hex HMAC-SHA256>`. The signed bytes are `timestamp + "." + rawBody`. Verify the MAC in constant time and reject timestamps outside a bounded window, such as five minutes, before parsing or processing. The Rust helpers `delivery::verify` and `delivery::verify_recent` implement the MAC and timestamp checks. Deduplicate by event ID in durable application storage; a valid signature alone does not prevent replay.
 

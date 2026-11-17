@@ -168,8 +168,9 @@ message Error {
     CODE_RATE_LIMITED = 7;
     // The session is not paired, logged out, or not in this project.
     CODE_SESSION_UNAVAILABLE = 8;
-    // The operation is refused for zero-knowledge sessions (for example a
-    // Campaign send).
+    // The operation is refused: for zero-knowledge sessions (for example a
+    // Campaign send), or because a recipient device's identity did not verify
+    // against its account.
     CODE_REFUSED = 9;
   }
   Code code = 1;
@@ -214,6 +215,9 @@ message Receive {
   int64 timestamp = 8;
   // Sender's alternate JID (PN for a LID sender and vice versa), if known.
   string sender_alt = 9;
+  // The stanza's <device-identity>, which a pkmsg from a companion device
+  // carries: a serialized ADVSignedDeviceIdentity. Empty otherwise.
+  bytes device_identity = 10;
 }
 
 // StatusReceive must be explicitly implemented. An unsupported service returns
@@ -421,6 +425,11 @@ message Bundle {
   bytes signed_pre_key_signature = 6;
   // Absent when the server had no one-time prekey left.
   PreKey pre_key = 7;
+  // The <device-identity> returned with this bundle: a serialized
+  // ADVSignedDeviceIdentity. Companion devices carry one; empty for a primary
+  // device. The service verifies a companion against its account's pinned
+  // identity before encrypting to it.
+  bytes device_identity = 8;
 }
 
 message ResolveGroup {

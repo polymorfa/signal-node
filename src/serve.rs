@@ -13,7 +13,7 @@ use crate::proto::{
     PreKeys, ReceiveResult, ServiceResponse, SignedPairing, Stanza, runner_request::Op,
     service_response::Result as Out,
 };
-use crate::resolver::{RemoteResolver, remote_bundle};
+use crate::resolver::{RemoteResolver, TokioRuntime, remote_bundle};
 use std::sync::Arc;
 use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::types::jid::JidExt as _;
@@ -94,7 +94,10 @@ pub async fn handle(
             .await
         }
         Op::GeneratePreKeys(request) => {
-            let keys = ops.generate_prekeys(request.count).await.map_err(fail)?;
+            let keys = ops
+                .generate_prekeys(&TokioRuntime, request.count)
+                .await
+                .map_err(fail)?;
             respond(Out::PreKeys(PreKeys {
                 pre_keys: keys
                     .into_iter()
@@ -113,7 +116,7 @@ pub async fn handle(
         }
         Op::PreparePreKeyUpload(request) => {
             let batch = ops
-                .prepare_prekey_upload(request.count)
+                .prepare_prekey_upload(&TokioRuntime, request.count)
                 .await
                 .map_err(fail)?;
             respond(Out::PreKeyUploadBatch(PreKeyUploadBatch {
@@ -212,6 +215,10 @@ pub async fn handle(
         Op::ForgetIdentity(request) => {
             let user = jid(&request.user, "user")?;
             ops.forget_user(&user).await.map_err(fail)?;
+            // Polymorfa is trusted to report identity changes (README), so
+            // its report also releases the account's pin: the next primary
+            // identity seen is pinned in its place.
+            ops.forget_account_identity(&user).await.map_err(fail)?;
             respond(Out::Ok(proto::Ok {}))
         }
         Op::MigratePnToLid(request) => {
@@ -279,6 +286,8 @@ async fn receive(
         ciphertext: &receive.ciphertext,
         padding_version,
         is_from_me: receive.is_from_me,
+        device_identity: (!receive.device_identity.is_empty())
+            .then_some(receive.device_identity.as_slice()),
     };
     let result = if status_kind.is_some() {
         ops.receive_status(request, status_session).await
@@ -388,6 +397,21 @@ async fn receive(
     }))
 }
 
+/// The application event ID for a received payload. The receipt key keys
+/// the session's own decrypt buffer and is identical for every session that
+/// receives the same ciphertext (two sessions in one group), so the event ID
+/// also binds the session: acknowledging one session's event never completes
+/// another's. Stable across redelivery to the same session.
+pub fn event_id(session_id: &str, receipt_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"signal-node app event v1\0");
+    hash.update((session_id.len() as u64).to_be_bytes());
+    hash.update(session_id.as_bytes());
+    hash.update(receipt_key.as_bytes());
+    hex::encode(hash.finalize())
+}
+
 /// The application event for a received message, or `None` when the
 /// message is protocol-only (sender keys, app-state keys, peer data
 /// operations) or is history and history delivery is off.
@@ -417,8 +441,9 @@ fn event_for(
         status_kind,
         content.message.group_status_message_v2.is_set(),
     );
+    let id = event_id(&session.id, &received.receipt_key);
     let base = |kind: &'static str| Event {
-        id: received.receipt_key.clone(),
+        id: id.clone(),
         kind,
         session_id: session.id.clone(),
         status_scope: status_kind.map(str::to_owned),
@@ -526,4 +551,20 @@ pub async fn uploaded_prekey_count(
         .uploaded_prekey_count()
         .await
         .map_err(|error| node.ops_error(session, &error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_id;
+
+    #[test]
+    fn event_ids_are_stable_per_session_and_distinct_across_sessions() {
+        let receipt = "same-group-ciphertext";
+        assert_eq!(event_id("alpha", receipt), event_id("alpha", receipt));
+        assert_ne!(event_id("alpha", receipt), event_id("beta", receipt));
+        assert_ne!(event_id("alpha", receipt), event_id("alpha", "other"));
+        // Length-prefixing the session keeps ("ab", "c…") apart from ("a", "bc…").
+        assert_ne!(event_id("ab", "cd"), event_id("a", "bcd"));
+        assert_eq!(event_id("alpha", receipt).len(), 64);
+    }
 }

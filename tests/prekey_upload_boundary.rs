@@ -1,4 +1,5 @@
 //! Durable upload recovery through the actual serialized WebSocket boundary.
+#[macro_use]
 mod support;
 
 use futures_util::StreamExt;
@@ -8,7 +9,7 @@ use signal_node::{
     store::{Backend, PostgresStore, SqliteStore},
 };
 use std::{path::PathBuf, time::Duration};
-use support::{APP_SECRET, Hub, config, peer, wait};
+use support::{APP_SECRET, Hub, config, pair, peer, vouch, wait};
 use wacore::types::jid::JidExt as _;
 use wacore_recordstore::{Namespace, RecordStore};
 use waproto::whatsapp as wa;
@@ -260,8 +261,18 @@ async fn consume_pending(
     identity: proto::Identity,
 ) {
     let generation = running.node.session(scope).unwrap().generation;
-    let (sender, _) = peer("upload-sender-fixture").await;
+    let (sender, sender_bundle) = peer("upload-sender-fixture").await;
     let target: wacore_binary::Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    // The node is a paired companion; each side pins the other's account.
+    let node_ops = running.node.session(scope).unwrap().ops().unwrap();
+    let node = pair(&*node_ops).await;
+    vouch(&sender, "222:1@s.whatsapp.net", &node.device_identity).await;
+    vouch(
+        &*node_ops,
+        "111:1@s.whatsapp.net",
+        &sender_bundle.device_identity,
+    )
+    .await;
     sender
         .establish_session(
             &target.to_protocol_address(),
@@ -273,15 +284,15 @@ async fn consume_pending(
                 signed_pre_key: identity.signed_pre_key,
                 signed_pre_key_signature: identity.signed_pre_key_signature,
                 pre_key: Some(batch.pre_keys[0].clone()),
+                device_identity: node.device_identity.clone(),
             })
             .unwrap(),
         )
         .await
         .unwrap();
-    let body = wa::Message {
-        conversation: Some("synthetic pending-prekey consumption".into()),
-        ..Default::default()
-    };
+    let body = proto!(wa::Message {
+        conversation: Some("synthetic pending-prekey consumption".into())
+    });
     let bytes = wacore::messages::MessageUtils::pad_message_v2(signal_node::message::encode(&body));
     let encrypted = sender
         .encrypt(&target.to_protocol_address(), &bytes)
@@ -306,6 +317,7 @@ async fn consume_pending(
         is_from_me: false,
         timestamp: 1720000000,
         sender_alt: String::new(),
+        device_identity: sender_bundle.device_identity,
     };
     let delivery = hub.request(name, request(scope, generation, Op::Receive(receive)));
     let app = async {

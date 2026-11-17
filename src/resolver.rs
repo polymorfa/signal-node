@@ -14,13 +14,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
+use wacore::client::context::{GroupRoutingInfo, SendContextResolver, SessionLockGuard};
 use wacore::libsignal::protocol::PreKeyBundle;
 use wacore::prekeys::PreKeyFetchOutcome;
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::types::message::AddressingMode;
 use wacore_binary::Jid;
-use wacore_signal_ops::RemoteBundle;
+use wacore_signal_ops::{FetchedBundle, RemoteBundle, SignalResolver, VerifiablePrekeys};
 
 /// Tokio-backed [`Runtime`] for the stanza builder.
 pub struct TokioRuntime;
@@ -85,6 +85,8 @@ pub fn remote_bundle(bundle: &proto::Bundle) -> anyhow::Result<RemoteBundle> {
             Some(pk) => Some((pk.id, array(&pk.public_key, "pre_key.public_key")?)),
             None => None,
         },
+        device_identity: (!bundle.device_identity.is_empty())
+            .then(|| bundle.device_identity.clone()),
     })
 }
 
@@ -94,6 +96,47 @@ impl RemoteResolver {
             .request(&self.session_id, self.generation, op)
             .await
             .map_err(|e: LinkError| anyhow::Error::new(e))
+    }
+
+    /// Fetch bundles from Polymorfa, keeping each companion's device identity.
+    async fn fetch_bundles(&self, jids: &[Jid]) -> anyhow::Result<Vec<(Jid, RemoteBundle)>> {
+        let op = service_request::Op::FetchPreKeys(proto::FetchPreKeys {
+            jids: jids.iter().map(ToString::to_string).collect(),
+        });
+        let runner_response::Result::Bundles(bundles) = self.ask(op).await? else {
+            return Err(LinkError::UnexpectedResponse.into());
+        };
+        let mut out = Vec::with_capacity(bundles.bundles.len());
+        for (jid, bundle) in &bundles.bundles {
+            let jid: Jid = jid
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Polymorfa returned an invalid JID"))?;
+            out.push((jid, remote_bundle(bundle)?));
+        }
+        Ok(out)
+    }
+}
+
+fn prekey_bundle(bundle: &RemoteBundle) -> anyhow::Result<PreKeyBundle> {
+    bundle
+        .to_prekey_bundle()
+        .map_err(|_| anyhow::anyhow!("Polymorfa returned an invalid prekey bundle"))
+}
+
+#[async_trait]
+impl SignalResolver for RemoteResolver {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        let mut out = VerifiablePrekeys::default();
+        for (jid, bundle) in self.fetch_bundles(jids).await? {
+            out.bundles.insert(
+                jid,
+                FetchedBundle {
+                    bundle: prekey_bundle(&bundle)?,
+                    device_identity: bundle.device_identity,
+                },
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -110,21 +153,9 @@ impl SendContextResolver for RemoteResolver {
     }
 
     async fn fetch_prekeys(&self, jids: &[Jid]) -> anyhow::Result<HashMap<Jid, PreKeyBundle>> {
-        let op = service_request::Op::FetchPreKeys(proto::FetchPreKeys {
-            jids: jids.iter().map(ToString::to_string).collect(),
-        });
-        let runner_response::Result::Bundles(bundles) = self.ask(op).await? else {
-            return Err(LinkError::UnexpectedResponse.into());
-        };
-        let mut out = HashMap::with_capacity(bundles.bundles.len());
-        for (jid, bundle) in &bundles.bundles {
-            let jid: Jid = jid
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Polymorfa returned an invalid JID"))?;
-            let bundle = remote_bundle(bundle)?
-                .to_prekey_bundle()
-                .map_err(|_| anyhow::anyhow!("Polymorfa returned an invalid prekey bundle"))?;
-            out.insert(jid, bundle);
+        let mut out = HashMap::new();
+        for (jid, bundle) in self.fetch_bundles(jids).await? {
+            out.insert(jid, prekey_bundle(&bundle)?);
         }
         Ok(out)
     }
@@ -137,6 +168,13 @@ impl SendContextResolver for RemoteResolver {
             bundles: self.fetch_prekeys(jids).await?,
             rejected: Vec::new(),
         })
+    }
+
+    /// `SignalOps` already holds every addressed device's session and account
+    /// locks, in both address forms, for the whole group fan-out, so wacore
+    /// needs no second lock set here.
+    async fn lock_device_sessions(&self, _device_jids: &[Jid]) -> SessionLockGuard {
+        SessionLockGuard::none()
     }
 
     async fn resolve_group_routing_info(&self, jid: &Jid) -> anyhow::Result<Arc<GroupRoutingInfo>> {
