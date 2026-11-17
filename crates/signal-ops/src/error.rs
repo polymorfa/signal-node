@@ -49,10 +49,22 @@ impl OpsError {
     pub fn is_fence_lost(&self) -> bool {
         match self {
             OpsError::Store(e) => state_is_refused(e),
-            OpsError::Signal(SignalProtocolError::BackendError(_, source)) => source
-                .downcast_ref::<StoreError>()
-                .is_some_and(state_is_refused),
+            OpsError::Signal(error) => signal_state_is_refused(error),
             _ => false,
         }
     }
+}
+
+fn signal_state_is_refused(error: &SignalProtocolError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<StoreError>()
+            .is_some_and(state_is_refused)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }

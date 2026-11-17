@@ -528,4 +528,37 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn service_classification_keeps_the_actual_finalization_fence_cause() {
+        let lost = wacore_recordstore::FenceLost {
+            scope: "authored-finalization-source".into(),
+            generation: 7,
+        }
+        .into_store_error();
+        let source = SignalProtocolError::BackendError("authored store", Box::new(lost));
+        let error = crate::OpsError::Signal(SignalProtocolError::BackendError(
+            "session finalization",
+            Box::new(SharedFinalizationError(Arc::new(source))),
+        ));
+        assert!(
+            error.is_fence_lost(),
+            "service lost the fence refusal inside its finalization wrapper"
+        );
+    }
+
+    #[test]
+    fn service_classification_does_not_turn_finalization_io_into_fence_loss() {
+        let source = SignalProtocolError::BackendError(
+            "authored store",
+            Box::new(wacore::store::error::StoreError::Io(std::io::Error::other(
+                "authored ordinary I/O",
+            ))),
+        );
+        let error = crate::OpsError::Signal(SignalProtocolError::BackendError(
+            "session finalization",
+            Box::new(SharedFinalizationError(Arc::new(source))),
+        ));
+        assert!(!error.is_fence_lost());
+    }
 }
