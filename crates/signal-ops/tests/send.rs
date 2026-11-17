@@ -939,6 +939,185 @@ async fn a_send_after_a_participant_is_removed_rotates_the_sender_key() {
     );
 }
 
+/// Alice in a group with Bob and Carol, both holding her first PN sender key.
+/// `acknowledge` records the server's ACK of that first send.
+async fn group_of_three(
+    scope: &str,
+    acknowledge: bool,
+) -> (
+    SignalOps<Store>,
+    SignalOps<Store>,
+    SignalOps<Store>,
+    ChangingGroupClient,
+    Vec<u8>,
+    [Jid; 4],
+) {
+    use wacore::types::message::AddressingMode;
+    let group: Jid = "54322@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let carol_jid: Jid = "333@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        &format!("alice-{scope}"),
+        &alice_jid.to_string(),
+        Some("900111:1@lid"),
+    )
+    .await;
+    let bob = device(&format!("bob-{scope}"), &bob_jid.to_string()).await;
+    let carol = device(&format!("carol-{scope}"), &carol_jid.to_string()).await;
+    let alice_paired = common::pair(&alice).await;
+    for peer in [&bob, &carol] {
+        peer.trust_account_identity(&alice_jid, alice_paired.account)
+            .await
+            .unwrap();
+    }
+    let identity = alice_paired.device_identity.clone();
+    let client = ChangingGroupClient::new(
+        FakeClient {
+            devices: vec![alice_jid.clone(), bob_jid.clone(), carol_jid.clone()],
+            bundles: HashMap::from([
+                (bob_jid.clone(), bundle_for(&bob).await),
+                (carol_jid.clone(), bundle_for(&carol).await),
+            ]),
+            device_identities: HashMap::new(),
+            group: Some(Arc::new(GroupRoutingInfo::new(
+                vec![alice_jid.to_non_ad(), bob_jid.clone(), carol_jid.clone()],
+                AddressingMode::Pn,
+            ))),
+        },
+        false,
+    );
+    let first = alice
+        .send_group(&TokioRuntime, &client, &group, &text("before"), "BEFORE")
+        .await
+        .unwrap();
+    for (peer, jid) in [(&bob, &bob_jid), (&carol, &carol_jid)] {
+        receive_group_component(
+            peer,
+            &group,
+            &alice_jid,
+            &identity,
+            enc_for(&first.stanza, jid),
+        )
+        .await
+        .unwrap();
+        receive_group_component(peer, &group, &alice_jid, &identity, skmsg_of(&first.stanza))
+            .await
+            .unwrap();
+    }
+    if acknowledge {
+        assert!(
+            alice
+                .mark_sender_key_distributed(
+                    &group,
+                    &first.distribution_targets,
+                    first.distribution_epoch
+                )
+                .await
+                .unwrap()
+        );
+    }
+    (
+        alice,
+        bob,
+        carol,
+        client,
+        identity,
+        [group, alice_jid, bob_jid, carol_jid],
+    )
+}
+
+/// Leave only Alice and Carol in the group, addressed by `mode`.
+fn without_bob(
+    client: &ChangingGroupClient,
+    alice: &Jid,
+    carol: &Jid,
+    mode: wacore::types::message::AddressingMode,
+) {
+    let mut current = client.current.write().unwrap();
+    current.devices = vec![alice.clone(), carol.clone()];
+    current.group = Some(Arc::new(GroupRoutingInfo::new(
+        vec![alice.to_non_ad(), carol.clone()],
+        mode,
+    )));
+}
+
+async fn assert_only_carol_reads(
+    after: &[u8],
+    bob: &SignalOps<Store>,
+    carol: &SignalOps<Store>,
+    identity: &[u8],
+    [group, alice_jid, bob_jid, carol_jid]: &[Jid; 4],
+) {
+    assert!(pairwise_enc_for(after, bob_jid).is_none());
+    assert!(
+        receive_group_component(bob, group, alice_jid, identity, skmsg_of(after))
+            .await
+            .is_err(),
+        "a removed participant can still read the group on a sender key it holds"
+    );
+    receive_group_component(carol, group, alice_jid, identity, enc_for(after, carol_jid))
+        .await
+        .unwrap();
+    let Received::Message(message) =
+        receive_group_component(carol, group, alice_jid, identity, skmsg_of(after))
+            .await
+            .unwrap()
+    else {
+        panic!("the remaining participant did not receive the message")
+    };
+    assert_eq!(
+        message.content.message.conversation.as_deref(),
+        Some("after")
+    );
+}
+
+#[tokio::test]
+async fn a_recipient_whose_acknowledgment_was_lost_is_still_rotated_out() {
+    // The runner's reply to the first send was lost, so nothing marked it.
+    let (alice, bob, carol, client, identity, jids) = group_of_three("lost-ack", false).await;
+    let [group, alice_jid, _, carol_jid] = &jids;
+    without_bob(
+        &client,
+        alice_jid,
+        carol_jid,
+        wacore::types::message::AddressingMode::Pn,
+    );
+    let after = alice
+        .send_group(&TokioRuntime, &client, group, &text("after"), "AFTER")
+        .await
+        .unwrap();
+    assert_only_carol_reads(&after.stanza, &bob, &carol, &identity, &jids).await;
+}
+
+#[tokio::test]
+async fn returning_to_an_earlier_addressing_mode_starts_a_fresh_sender_key() {
+    use wacore::types::message::AddressingMode;
+    let (alice, bob, carol, client, identity, jids) = group_of_three("mode-trip", true).await;
+    let [group, alice_jid, _, carol_jid] = &jids;
+    // Bob leaves while the group is briefly addressed by LID. Alice is its only
+    // member then, so that send changes the chain without needing any bundle.
+    {
+        let mut current = client.current.write().unwrap();
+        current.devices = vec![alice_jid.clone()];
+        current.group = Some(Arc::new(GroupRoutingInfo::new(
+            vec!["900111@lid".parse().unwrap()],
+            AddressingMode::Lid,
+        )));
+    }
+    alice
+        .send_group(&TokioRuntime, &client, group, &text("lid"), "LID")
+        .await
+        .unwrap();
+    // Back to PN without Bob: the old PN chain he holds must not come back.
+    without_bob(&client, alice_jid, carol_jid, AddressingMode::Pn);
+    let after = alice
+        .send_group(&TokioRuntime, &client, group, &text("after"), "AFTER")
+        .await
+        .unwrap();
+    assert_only_carol_reads(&after.stanza, &bob, &carol, &identity, &jids).await;
+}
+
 #[tokio::test]
 async fn group_encryption_keeps_the_address_selected_before_session_locking() {
     use wacore::types::message::AddressingMode;

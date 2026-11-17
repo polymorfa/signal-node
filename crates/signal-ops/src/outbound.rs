@@ -768,7 +768,10 @@ impl<S: ServiceStore> SignalOps<S> {
                     };
 
                     let staged = std::sync::Arc::new(self.store().staged());
-                    if removed {
+                    // A mode change deletes both chains too: returning to an
+                    // earlier mode must not revive a chain whose holder history
+                    // was cleared when the mode changed.
+                    if removed || chain_changed {
                         for own in [&own_jid, &own_lid] {
                             let name = SenderKeyName::from_parts(
                                 &group_str,
@@ -845,7 +848,7 @@ impl<S: ServiceStore> SignalOps<S> {
                             to: group,
                             message,
                             message_id,
-                            force_distribution: force || removed,
+                            force_distribution: force || removed || chain_changed,
                             distribution_targets: Some(targets),
                             distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                             phash_devices: Some(&addressed),
@@ -858,6 +861,18 @@ impl<S: ServiceStore> SignalOps<S> {
                     .await
                     .map_err(send_error)?;
 
+                    // Record everyone this stanza gives the key to as a holder
+                    // now, in the send's own batch: a lost runner reply must not
+                    // leave a recipient who left later undetected.
+                    for device in &prepared.skdm_devices {
+                        staged
+                            .put_aux(
+                                Namespace::SenderKeyDevices,
+                                &sender_key_holder_key(&group_str, device),
+                                &[1],
+                            )
+                            .await?;
+                    }
                     let encoded = waproto::codec::message_to_vec(message);
                     staged
                         .put_aux(
