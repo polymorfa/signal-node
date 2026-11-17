@@ -319,6 +319,10 @@ impl Node {
                 format!("pairing refused: {code} {text}"),
             ),
             OpsError::Send(_) => proto::Error::new(Code::Unavailable, "building the stanza failed"),
+            OpsError::BundleRefused(rejection) => proto::Error::new(
+                Code::Refused,
+                format!("recipient identity not verified: {rejection}"),
+            ),
             OpsError::Signal(_) => proto::Error::new(Code::Internal, "signal protocol error"),
         }
     }

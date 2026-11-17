@@ -1,4 +1,16 @@
 #![allow(dead_code)]
+
+/// Build a generated protobuf message, whose structs are `#[non_exhaustive]`
+/// and cannot be written as struct literals outside their crate: start from
+/// `Default` and set the listed fields.
+#[allow(unused_macros)]
+macro_rules! proto {
+    ($ty:path { $($field:ident: $value:expr),* $(,)? }) => {{
+        let mut message = <$ty>::default();
+        $(message.$field = $value;)*
+        message
+    }};
+}
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use signal_node::{
@@ -448,6 +460,24 @@ pub async fn peer(
     >,
     proto::Bundle,
 ) {
+    peer_under(scope, None).await
+}
+/// A fixture peer paired under `account` when given (another device of that
+/// account), otherwise under a fresh account of its own.
+pub async fn peer_under(
+    scope: &str,
+    account: Option<&wacore::libsignal::protocol::KeyPair>,
+) -> (
+    Arc<
+        wacore_signal_ops::SignalOps<
+            wacore_recordstore::RecordSignalStore<
+                wacore_recordstore::MemoryRecordStore,
+                wacore_recordstore::AesGcmSealer,
+            >,
+        >,
+    >,
+    proto::Bundle,
+) {
     use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
     let records = Arc::new(MemoryRecordStore::new());
     let lease = records
@@ -461,8 +491,18 @@ pub async fn peer(
         lease.fence,
     ));
     let ops = Arc::new(wacore_signal_ops::SignalOps::create(store).await.unwrap());
+    // Every fixture peer is a paired companion, so its bundle carries the
+    // device identity a sender verifies it with.
+    let device_identity = match account {
+        Some(account) => pair_under(&*ops, account).await,
+        None => pair(&*ops).await.device_identity,
+    };
     let identity = ops.public_identity().await;
-    let pre = ops.generate_prekeys(1).await.unwrap().remove(0);
+    let pre = ops
+        .generate_prekeys(&signal_node::resolver::TokioRuntime, 1)
+        .await
+        .unwrap()
+        .remove(0);
     let bundle = proto::Bundle {
         registration_id: identity.registration_id,
         device_id: 1,
@@ -474,29 +514,76 @@ pub async fn peer(
             id: pre.id,
             public_key: pre.public_key.to_vec(),
         }),
+        device_identity,
     };
     (ops, bundle)
 }
-pub async fn pair<S: wacore_signal_ops::ServiceStore>(ops: &wacore_signal_ops::SignalOps<S>) {
+/// A paired device as its peers see it: the account key that signed it, and
+/// the `<device-identity>` its bundles and prekey messages carry.
+pub struct Paired {
+    pub account: [u8; 32],
+    /// The account key pair, to pair another device under the same account.
+    pub account_keys: wacore::libsignal::protocol::KeyPair,
+    pub device_identity: Vec<u8>,
+}
+
+/// Pin the account that signed `device_identity` for `jid` on `ops`, as a
+/// sender does once it has met that account's primary device.
+pub async fn vouch<S: wacore_signal_ops::ServiceStore>(
+    ops: &wacore_signal_ops::SignalOps<S>,
+    jid: &str,
+    device_identity: &[u8],
+) {
+    let signed = waproto::codec::adv_signed_device_identity_decode(device_identity).unwrap();
+    let account: [u8; 32] = signed
+        .account_signature_key
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    ops.trust_account_identity(&jid.parse().unwrap(), account)
+        .await
+        .unwrap();
+}
+
+pub async fn pair<S: wacore_signal_ops::ServiceStore>(
+    ops: &wacore_signal_ops::SignalOps<S>,
+) -> Paired {
+    use wacore::libsignal::protocol::KeyPair;
+    let mut rng = rand10::make_rng::<rand10::rngs::StdRng>();
+    let account = KeyPair::generate(&mut rng);
+    let device_identity = pair_under(ops, &account).await;
+    Paired {
+        account: *account.public_key.public_key_bytes(),
+        account_keys: account,
+        device_identity,
+    }
+}
+
+/// Pair `ops` under an existing `account` key, as a primary does for another
+/// device of the same account. Returns its `<device-identity>`.
+pub async fn pair_under<S: wacore_signal_ops::ServiceStore>(
+    ops: &wacore_signal_ops::SignalOps<S>,
+    account: &wacore::libsignal::protocol::KeyPair,
+) -> Vec<u8> {
     use hmac::Mac;
     use wacore::libsignal::protocol::{KeyPair, PublicKey};
     use waproto::whatsapp as wa;
     let mut rng = rand10::make_rng::<rand10::rngs::StdRng>();
-    let account = KeyPair::generate(&mut rng);
     let identity = ops.public_identity().await;
     let device = KeyPair::new(
         PublicKey::from_djb_public_key_bytes(&identity.identity_key).unwrap(),
         KeyPair::generate(&mut rng).private_key,
     );
-    let details = signal_node::message::encode(&wa::ADVDeviceIdentity {
+    let details = signal_node::message::encode(&proto!(wa::ADVDeviceIdentity {
         raw_id: Some(1),
         timestamp: Some(0),
         key_index: Some(1),
         account_type: Some(wa::ADVEncryptionType::E2EE),
-        device_type: Some(wa::ADVEncryptionType::E2EE),
-    });
+        device_type: Some(wa::ADVEncryptionType::E2EE)
+    }));
     let signed = signal_node::message::encode(&wacore::adv::test_util::signed_identity(
-        &account,
+        account,
         &device,
         &details,
         wacore::adv::test_util::account_prefix(Some(wa::ADVEncryptionType::E2EE)),
@@ -505,10 +592,10 @@ pub async fn pair<S: wacore_signal_ops::ServiceStore>(ops: &wacore_signal_ops::S
     ));
     let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(&identity.adv_secret).unwrap();
     mac.update(&signed);
-    let container = signal_node::message::encode(&wa::ADVSignedDeviceIdentityHMAC {
+    let container = signal_node::message::encode(&proto!(wa::ADVSignedDeviceIdentityHMAC {
         details: Some(signed),
         hmac: Some(mac.finalize().into_bytes().to_vec()),
-        account_type: Some(wa::ADVEncryptionType::E2EE),
-    });
-    ops.sign_pairing(&container).await.unwrap();
+        account_type: Some(wa::ADVEncryptionType::E2EE)
+    }));
+    ops.sign_pairing(&container).await.unwrap().signed_identity
 }

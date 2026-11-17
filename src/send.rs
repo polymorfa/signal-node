@@ -71,6 +71,7 @@ enum Built {
         stanza: Vec<u8>,
         phash: Option<String>,
         targets: Vec<Jid>,
+        epoch: u64,
     },
 }
 
@@ -127,6 +128,7 @@ pub async fn send(
                     stanza: prepared.stanza,
                     phash: prepared.phash,
                     targets: prepared.distribution_targets,
+                    epoch: prepared.distribution_epoch,
                 }
             } else {
                 let prepared = ops
@@ -184,10 +186,15 @@ pub async fn send(
             // WA Web marks the sender key as held once the server acks, before
             // it looks at the participant hash (WAWebSendGroupSkmsgJob.js:188-205,
             // Cellar bundle whatsapp-1051710191).
-            if let Built::Group { targets, .. } = &built
+            if let Built::Group { targets, epoch, .. } = &built
                 && !targets.is_empty()
-                && let Err(e) = ops.mark_sender_key_distributed(&to, targets).await
             {
+                match ops.mark_sender_key_distributed(&to, targets, *epoch).await {
+                    Ok(true) => {}
+                    // The group's sender key rotated after this send was built,
+                    // so its targets hold the old key; the next send redistributes.
+                    Ok(false) => tracing::debug!(connection = %connection.id, message_id = %message_id, "sender key rotated before the send was acknowledged"),
+                    Err(e) => {
                 // The runner has already confirmed the send. A failed local
                 // distribution mark must not invite a new message ID. Only fence
                 // loss stops the same-ID mismatch resend and retires this connection.
@@ -199,6 +206,8 @@ pub async fn send(
                         server_timestamp: result.server_timestamp,
                         resent,
                     });
+                }
+                    }
                 }
             }
             tracing::info!(connection = %connection.id, message_id = %message_id, resent, "sent");

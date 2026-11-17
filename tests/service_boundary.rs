@@ -1,3 +1,4 @@
+#[macro_use]
 mod support;
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -45,7 +46,35 @@ async fn encrypted(
     else {
         panic!("prekeys response missing")
     };
-    let (peer, _) = peer("alice-fixture").await;
+    // The node is a paired companion of its own account. The sender is either
+    // a companion of another account the node has pinned, or, for an own
+    // device message, another device paired under the node's own account.
+    let node_ops = connection.ops().unwrap();
+    let node = pair(&*node_ops).await;
+    // The hub's claim reply names this account's phone number; the service
+    // cannot apply it before the device keys exist.
+    node_ops
+        .set_own_jids("222:1@s.whatsapp.net", None)
+        .await
+        .unwrap();
+    let bob: wacore_binary::Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let (peer, peer_bundle) =
+        peer_under("alice-fixture", from_me.then_some(&node.account_keys)).await;
+    let sender = if from_me {
+        peer.set_own_jids("222:2@s.whatsapp.net", None)
+            .await
+            .unwrap();
+        "222:2@s.whatsapp.net"
+    } else {
+        vouch(&peer, "222:1@s.whatsapp.net", &node.device_identity).await;
+        vouch(
+            &*node_ops,
+            "111:1@s.whatsapp.net",
+            &peer_bundle.device_identity,
+        )
+        .await;
+        "111:1@s.whatsapp.net"
+    };
     let bundle = proto::Bundle {
         registration_id: identity.registration_id,
         device_id: 1,
@@ -54,8 +83,8 @@ async fn encrypted(
         signed_pre_key: identity.signed_pre_key,
         signed_pre_key_signature: identity.signed_pre_key_signature,
         pre_key: Some(keys.pre_keys[0].clone()),
+        device_identity: node.device_identity,
     };
-    let bob: wacore_binary::Jid = "222:1@s.whatsapp.net".parse().unwrap();
     peer.establish_session(
         &bob.to_protocol_address(),
         &signal_node::resolver::remote_bundle(&bundle).unwrap(),
@@ -69,7 +98,7 @@ async fn encrypted(
         .unwrap();
     proto::Receive {
         chat: "111@s.whatsapp.net".into(),
-        sender: "111:1@s.whatsapp.net".into(),
+        sender: sender.into(),
         message_id: "message-fixture".into(),
         kind: match cipher.kind {
             wacore_signal_ops::EncKind::PreKey => "pkmsg",
@@ -81,6 +110,7 @@ async fn encrypted(
         is_from_me: from_me,
         timestamp: 1720000000,
         sender_alt: String::new(),
+        device_identity: peer_bundle.device_identity,
     }
 }
 async fn next_event<S>(stream: &mut S) -> Value
@@ -195,10 +225,9 @@ async fn an_unrelated_sse_filter_does_not_make_a_connection_wait_for_an_ack() {
         &hub,
         "node-filter",
         &running,
-        wa::Message {
-            conversation: Some("unwatched fixture".into()),
-            ..Default::default()
-        },
+        proto!(wa::Message {
+            conversation: Some("unwatched fixture".into())
+        }),
         false,
     )
     .await;
@@ -238,10 +267,9 @@ async fn real_encrypted_receive_requires_app_ack_then_is_durable_and_sealed() {
         &hub,
         "node-receive",
         &running,
-        wa::Message {
-            conversation: Some("application-private-text".into()),
-            ..Default::default()
-        },
+        proto!(wa::Message {
+            conversation: Some("application-private-text".into())
+        }),
         false,
     )
     .await;
@@ -340,10 +368,9 @@ async fn unacknowledged_receive_replays_across_crash_and_old_holder_is_fenced() 
         &hub,
         "node-crash-a",
         &first,
-        wa::Message {
-            conversation: Some("application-private-text".into()),
-            ..Default::default()
-        },
+        proto!(wa::Message {
+            conversation: Some("application-private-text".into())
+        }),
         false,
     )
     .await;
@@ -359,7 +386,10 @@ async fn unacknowledged_receive_replays_across_crash_and_old_holder_is_fenced() 
     let second = start(&hub, "node-crash-b", Backend::Memory(records), false).await;
     let generation2 = second.node.connection(CONNECTION).unwrap().generation;
     assert!(generation2 > generation);
-    let old_write = stale.generate_prekeys(1).await.unwrap_err();
+    let old_write = stale
+        .generate_prekeys(&signal_node::resolver::TokioRuntime, 1)
+        .await
+        .unwrap_err();
     assert!(old_write.is_fence_lost());
     let client = reqwest::Client::new();
     let url = format!("http://{}", second.http_addr);
@@ -396,19 +426,18 @@ async fn unacknowledged_receive_replays_across_crash_and_old_holder_is_fenced() 
 }
 
 fn app_state_share() -> wa::message::AppStateSyncKeyShare {
-    wa::message::AppStateSyncKeyShare {
-        keys: vec![wa::message::AppStateSyncKey {
-            key_id: Some(wa::message::AppStateSyncKeyId {
-                key_id: Some(vec![3; 32]),
-            })
+    proto!(wa::message::AppStateSyncKeyShare {
+        keys: vec![proto!(wa::message::AppStateSyncKey {
+            key_id: Some(proto!(wa::message::AppStateSyncKeyId {
+                key_id: Some(vec![3; 32])
+            }))
             .into(),
-            key_data: Some(wa::message::AppStateSyncKeyData {
-                key_data: Some(vec![4; 32]),
-                ..Default::default()
-            })
-            .into(),
-        }],
-    }
+            key_data: Some(proto!(wa::message::AppStateSyncKeyData {
+                key_data: Some(vec![4; 32])
+            }))
+            .into()
+        })]
+    })
 }
 
 #[tokio::test]
@@ -439,20 +468,17 @@ async fn app_state_keys_require_separate_consent_and_an_own_device() {
             &hub,
             "node-app-state",
             &running,
-            wa::Message {
-                protocol_message: wa::message::ProtocolMessage {
+            proto!(wa::Message {
+                protocol_message: proto!(wa::message::ProtocolMessage {
                     r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
-                    app_state_sync_key_share: Some(expected.clone()).into(),
-                    ..Default::default()
-                }
-                .into(),
-                message_context_info: Some(wa::MessageContextInfo {
-                    message_secret: Some(vec![9; 32]),
-                    ..Default::default()
+                    app_state_sync_key_share: Some(expected.clone()).into()
                 })
                 .into(),
-                ..Default::default()
-            },
+                message_context_info: Some(proto!(wa::MessageContextInfo {
+                    message_secret: Some(vec![9; 32])
+                }))
+                .into()
+            }),
             from_me,
         )
         .await;
@@ -519,15 +545,13 @@ async fn app_state_share_survives_a_lost_reply_and_restart_with_live_consent_che
         &hub,
         "node-share-replay",
         &running,
-        wa::Message {
-            protocol_message: wa::message::ProtocolMessage {
+        proto!(wa::Message {
+            protocol_message: proto!(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
-                app_state_sync_key_share: Some(share.clone()).into(),
-                ..Default::default()
-            }
-            .into(),
-            ..Default::default()
-        },
+                app_state_sync_key_share: Some(share.clone()).into()
+            })
+            .into()
+        }),
         true,
     )
     .await;
@@ -598,24 +622,21 @@ async fn history_stays_off_until_explicit_consent_and_delivers_only_the_notifica
         )
         .await;
         let generation = running.node.connection(CONNECTION).unwrap().generation;
-        let message = wa::Message {
-            protocol_message: wa::message::ProtocolMessage {
+        let message = proto!(wa::Message {
+            protocol_message: proto!(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::HistorySyncNotification),
-                history_sync_notification: wa::message::HistorySyncNotification {
+                history_sync_notification: proto!(wa::message::HistorySyncNotification {
                     direct_path: Some("/fixture/history".into()),
                     media_key: Some(vec![1; 32]),
                     file_sha256: Some(vec![2; 32]),
                     file_enc_sha256: Some(vec![3; 32]),
                     file_length: Some(1234),
-                    chunk_order: Some(1),
-                    ..Default::default()
-                }
-                .into(),
-                ..Default::default()
-            }
-            .into(),
-            ..Default::default()
-        };
+                    chunk_order: Some(1)
+                })
+                .into()
+            })
+            .into()
+        });
         let receive = encrypted(&hub, "node-history", &running, message, from_me).await;
         let client = reqwest::Client::new();
         let url = format!("http://{}", running.http_addr);
@@ -679,11 +700,13 @@ async fn http_send_stanza_round_trips_into_the_other_device_and_never_exceeds_fi
     let generation = running.node.connection(CONNECTION).unwrap().generation;
     identity(&hub, "node-send", generation).await;
     let ops = running.node.connection(CONNECTION).unwrap().ops().unwrap();
-    pair(&*ops).await;
+    let node = pair(&*ops).await;
     ops.set_own_jids("222:1@s.whatsapp.net", None)
         .await
         .unwrap();
     let (peer, bundle) = peer("send-peer").await;
+    vouch(&peer, "222:1@s.whatsapp.net", &node.device_identity).await;
+    vouch(&*ops, "111:1@s.whatsapp.net", &bundle.device_identity).await;
     hub.bundle("111:1@s.whatsapp.net", bundle).await;
     let client = reqwest::Client::new();
     let url = format!(
@@ -732,12 +755,20 @@ async fn http_send_stanza_round_trips_into_the_other_device_and_never_exceeds_fi
     let Some(wacore_binary::node::NodeContent::Bytes(ciphertext)) = &payload.content else {
         panic!("encrypted content missing")
     };
+    let device_identity = match node
+        .get_optional_child("device-identity")
+        .and_then(|child| child.content.as_ref())
+    {
+        Some(wacore_binary::node::NodeContent::Bytes(bytes)) => Some(bytes.as_slice()),
+        _ => None,
+    };
     let bob: wacore_binary::Jid = "222:1@s.whatsapp.net".parse().unwrap();
     let opened = peer
         .decrypt(
             &bob.to_protocol_address(),
             wacore_signal_ops::EncKind::PreKey,
             ciphertext,
+            device_identity,
         )
         .await
         .unwrap();
@@ -770,6 +801,7 @@ async fn a_lost_send_reply_reports_the_original_unconfirmed_message_without_retr
             .await
             .unwrap();
         let (_peer, bundle) = peer("uncertain-peer").await;
+        vouch(&*ops, "111:1@s.whatsapp.net", &bundle.device_identity).await;
         hub.bundle("111:1@s.whatsapp.net", bundle).await;
         hub.lose_send_reply(disconnect);
         let response = reqwest::Client::new()
@@ -821,6 +853,7 @@ async fn a_failed_mismatch_resend_keeps_the_original_message_unconfirmed() {
             .await
             .unwrap();
         let (_peer, bundle) = peer("resend-peer").await;
+        vouch(&*ops, "111:1@s.whatsapp.net", &bundle.device_identity).await;
         hub.bundle("111:1@s.whatsapp.net", bundle).await;
         hub.fail_resend(failure);
         let response = reqwest::Client::new()
@@ -879,12 +912,13 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
             .await
             .unwrap();
         let (_peer, bundle) = peer("mark-failure-peer").await;
+        vouch(&*ops, "111:1@s.whatsapp.net", &bundle.device_identity).await;
         hub.bundle("111:1@s.whatsapp.net", bundle).await;
         if mismatch {
             hub.mismatch_next_send();
         }
         if !fence_lost {
-            sqlx::query("CREATE TRIGGER fail_distribution BEFORE INSERT ON signal_records WHEN NEW.ns = 'sender_key_devices' BEGIN SELECT RAISE(ABORT, 'synthetic distribution write failure'); END")
+            sqlx::query("CREATE TRIGGER fail_distribution BEFORE INSERT ON signal_records WHEN NEW.ns = 'sender_key_devices' AND instr(NEW.key, x'00') > 0 BEGIN SELECT RAISE(ABORT, 'synthetic distribution write failure'); END")
                 .execute(&pool).await.unwrap();
         }
         let (observed, release) = hub.gate_next_send().await;
@@ -1036,10 +1070,9 @@ async fn webhook_signature_failure_and_ack_gate_durable_delivery() {
         &hub,
         "node-webhook",
         &running,
-        wa::Message {
-            conversation: Some("webhook-secret-text".into()),
-            ..Default::default()
-        },
+        proto!(wa::Message {
+            conversation: Some("webhook-secret-text".into())
+        }),
         false,
     )
     .await;
@@ -1166,7 +1199,12 @@ async fn process_incarnations_with_the_same_node_id_cannot_share_a_fence() {
             .is_some_and(|s| s.generation > old.generation)
     })
     .await;
-    assert!(ops.generate_prekeys(1).await.unwrap_err().is_fence_lost());
+    assert!(
+        ops.generate_prekeys(&signal_node::resolver::TokioRuntime, 1)
+            .await
+            .unwrap_err()
+            .is_fence_lost()
+    );
     first.node.shutdown().await;
     replacement.shutdown().await;
 }
@@ -1208,58 +1246,52 @@ async fn group_retry_rejects_unknown_or_missing_addressing_mode() {
 async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_history() {
     for (protocol, from_me) in [
         (
-            wa::message::ProtocolMessage {
+            proto!(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
-                app_state_sync_key_share: Some(app_state_share()).into(),
-                ..Default::default()
-            },
+                app_state_sync_key_share: Some(app_state_share()).into()
+            }),
             true,
         ),
         (
-            wa::message::ProtocolMessage {
+            proto!(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyShare),
-                app_state_sync_key_share: Some(wa::message::AppStateSyncKeyShare {
-                    keys: vec![wa::message::AppStateSyncKey {
-                        key_id: Some(wa::message::AppStateSyncKeyId {
-                            key_id: Some(vec![3; 32]),
-                        })
+                app_state_sync_key_share: Some(proto!(wa::message::AppStateSyncKeyShare {
+                    keys: vec![proto!(wa::message::AppStateSyncKey {
+                        key_id: Some(proto!(wa::message::AppStateSyncKeyId {
+                            key_id: Some(vec![3; 32])
+                        }))
                         .into(),
-                        key_data: Some(wa::message::AppStateSyncKeyData {
-                            key_data: Some(vec![4; 32]),
-                            ..Default::default()
-                        })
-                        .into(),
-                    }],
-                })
-                .into(),
-                ..Default::default()
-            },
+                        key_data: Some(proto!(wa::message::AppStateSyncKeyData {
+                            key_data: Some(vec![4; 32])
+                        }))
+                        .into()
+                    })]
+                }))
+                .into()
+            }),
             false,
         ),
         (
-            wa::message::ProtocolMessage {
+            proto!(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::HistorySyncNotification),
-                history_sync_notification: Some(wa::message::HistorySyncNotification {
+                history_sync_notification: Some(proto!(wa::message::HistorySyncNotification {
                     direct_path: Some("/never-release-without-consent".into()),
-                    media_key: Some(vec![5; 32]),
-                    ..Default::default()
-                })
-                .into(),
-                ..Default::default()
-            },
+                    media_key: Some(vec![5; 32])
+                }))
+                .into()
+            }),
             true,
         ),
         (
-            wa::message::ProtocolMessage {
+            proto!(wa::message::ProtocolMessage {
                 r#type: Some(
                     wa::message::protocol_message::Type::PeerDataOperationRequestResponseMessage,
                 ),
                 peer_data_operation_request_response_message: Some(
                     wa::message::PeerDataOperationRequestResponseMessage::default(),
                 )
-                .into(),
-                ..Default::default()
-            },
+                .into()
+            }),
             false,
         ),
     ] {
@@ -1276,16 +1308,14 @@ async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_hi
             &hub,
             "node-mixed",
             &running,
-            wa::Message {
+            proto!(wa::Message {
                 conversation: Some("mixed-user-content".into()),
                 protocol_message: Some(protocol).into(),
-                message_context_info: Some(wa::MessageContextInfo {
-                    message_secret: Some(vec![9; 32]),
-                    ..Default::default()
-                })
-                .into(),
-                ..Default::default()
-            },
+                message_context_info: Some(proto!(wa::MessageContextInfo {
+                    message_secret: Some(vec![9; 32])
+                }))
+                .into()
+            }),
             from_me,
         )
         .await;

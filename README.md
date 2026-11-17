@@ -8,8 +8,8 @@ This repository is private. The implementation is under review and has not been 
 
 - Runner protocol: [`proto/polymorfa/signal/v1/signal_service.proto`](proto/polymorfa/signal/v1/signal_service.proto), version `1`, subprotocol `polymorfa.signal.v1`, originating at `b6d5f5f`.
 - Application API: [`docs/app-api.openapi.json`](docs/app-api.openapi.json). JSON field names use snake_case. Event and message timestamps use Unix seconds; lease expiry uses Unix milliseconds internally.
-- Signal libraries: exact `polymorfa/whatsapp-rust` revision `4b3b13cacd40a27573d0246386db553ef887539b`, the unmerged [recordstore/Signal operations producer PR](https://github.com/polymorfa/whatsapp-rust/pull/5). All five normal/dev crate families use this same source. A successful local build does not make that producer a released dependency.
-- Rust MSRV: `1.94`. The checked-in toolchain selects `1.94.0`.
+- Signal libraries: `wacore`, `wacore-binary` and `waproto` use exact `oxidezap/whatsapp-rust` revision `2671430db6161c01c507587d0e3c90dcf153aa85`. `wacore-recordstore` and `wacore-signal-ops` are workspace crates under `crates/`. A successful local build does not establish published dependencies or live-provider acceptance.
+- Rust MSRV: `1.95`. The checked-in toolchain selects `1.95.0`.
 
 The server connection uses a project credential in `Authorization`, never in a URL or browser. The local API uses a separate application bearer secret. It rejects every authenticated request with an `Origin` header, including `Origin: null`, and supplies no CORS permission. Browser/WASM remote transport is unavailable until Polymorfa provides a distinct, short-lived client grant backed by live authorization. Never put the project credential or application secret in a browser.
 
@@ -23,7 +23,7 @@ Upgrade the supporting service before a runner requires these operations. An old
 
 ## Run
 
-Build the binary with Rust 1.94 or newer:
+Build the binary with Rust 1.95 or newer:
 
 ```sh
 cargo build --release --locked
@@ -85,7 +85,7 @@ Events contain a stable `id`, `type`, `connection_id`, routing metadata, `messag
 A receive that produces an application event succeeds only after one application acknowledgment. With both channels enabled, the first successful webhook or SSE acknowledgment wins.
 
 - Webhook: any `2xx` response acknowledges the event. Persist/deduplicate the event before responding. Non-`2xx`, redirects, timeouts and connection failures do not acknowledge it.
-- SSE: persist/deduplicate the event, then POST its `id` to the ACK route. Multiple subscribers receive the same event; one acknowledgment completes all pending receives for that ID. Keep authorization headers on the stream and ACK request.
+- SSE: persist/deduplicate the event, then POST its `id` to the ACK route. Multiple subscribers receive the same event; one acknowledgment completes all pending receives for that ID. IDs are unique per connection: two connections that receive the same group message get different IDs. Keep authorization headers on the stream and ACK request.
 
 The webhook signs the exact request body bytes. Headers are `Signal-Node-Timestamp` (Unix seconds), `Signal-Node-Event-Id`, and `Signal-Node-Signature: v1=<hex HMAC-SHA256>`. The signed bytes are `timestamp + "." + rawBody`. Verify the MAC in constant time and reject timestamps outside a bounded window, such as five minutes, before parsing or processing. The Rust helpers `delivery::verify` and `delivery::verify_recent` implement the MAC and timestamp checks. Deduplicate by event ID in durable application storage; a valid signature alone does not prevent replay.
 
@@ -125,6 +125,8 @@ blocklists use those app-state keys.
 
 Zero-knowledge connections do not use hosted message history or content-dependent Campaigns. Polymorfa still sees routing and operational metadata required for transport. The customer service and application see plaintext. A compromised customer host or application bearer can expose it. This service does not remove the need to protect the customer runtime, backups and application database.
 
+Polymorfa holds the WhatsApp connection, so this service learns recipients' devices and public keys from Polymorfa, much as a WhatsApp client learns them from WhatsApp's servers. It checks that each key bundle is well formed and signed by the identity key the bundle presents, but it cannot independently verify that the identity key belongs to the intended recipient. Polymorfa is trusted to relay device lists, prekey bundles and identity-change notices faithfully. A Polymorfa runner that substituted a key or added a device could read messages encrypted to that key. That affects first contact with a recipient, newly listed devices, and contacts whose stored identity it caused this service to forget. It does not expose this service's stored keys or other recipients' sessions. Independent key verification is not implemented.
+
 ## Storage and key custody
 
 Use SQLite for a deployment on one host, or PostgreSQL for multiple hosts. SQLite uses WAL and `BEGIN IMMEDIATE` for atomic fence checks and write batches. Multiple processes can share one local file; do not place that file on a network filesystem for multi-host failover. PostgreSQL locks the lease row and commits each fence check with its write batch. Startup runs the checked-in driver migrations; the database identity needs schema/migration permissions. Use a dedicated customer-owned database and network/TLS policy. The `memory` driver loses state on restart and is for tests only.
@@ -149,11 +151,11 @@ After a participant-hash mismatch, the service refreshes routing and rebuilds on
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 # Use a dedicated fixture database; do not point tests at production.
 SIGNAL_NODE_TEST_POSTGRES_URL=postgres://fixture@127.0.0.1/signal_node_tests \
-  cargo test --all-targets --locked
-cargo test --doc --locked
+  cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
 cargo build --release --locked
 ```
 

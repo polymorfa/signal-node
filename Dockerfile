@@ -1,9 +1,10 @@
-FROM rust:1.94.0-bookworm AS build
+FROM rust:1.95.0-bookworm AS build
 WORKDIR /source
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
 COPY migrations ./migrations
 COPY src ./src
+COPY crates ./crates
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime

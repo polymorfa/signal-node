@@ -13,7 +13,7 @@ use crate::proto::{
     PreKeys, ReceiveResult, ServiceResponse, SignedPairing, Stanza, runner_request::Op,
     service_response::Result as Out,
 };
-use crate::resolver::{RemoteResolver, remote_bundle};
+use crate::resolver::{RemoteResolver, TokioRuntime, remote_bundle};
 use std::sync::Arc;
 use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::types::jid::JidExt as _;
@@ -71,7 +71,10 @@ pub async fn handle(
         Op::GetIdentity(_) => unreachable!("handled above"),
         Op::Receive(receive) => self::receive(node, connection, &ops, receive).await,
         Op::GeneratePreKeys(request) => {
-            let keys = ops.generate_prekeys(request.count).await.map_err(fail)?;
+            let keys = ops
+                .generate_prekeys(&TokioRuntime, request.count)
+                .await
+                .map_err(fail)?;
             respond(Out::PreKeys(PreKeys {
                 pre_keys: keys
                     .into_iter()
@@ -90,7 +93,7 @@ pub async fn handle(
         }
         Op::PreparePreKeyUpload(request) => {
             let batch = ops
-                .prepare_prekey_upload(request.count)
+                .prepare_prekey_upload(&TokioRuntime, request.count)
                 .await
                 .map_err(fail)?;
             respond(Out::PreKeyUploadBatch(PreKeyUploadBatch {
@@ -189,6 +192,10 @@ pub async fn handle(
         Op::ForgetIdentity(request) => {
             let user = jid(&request.user, "user")?;
             ops.forget_user(&user).await.map_err(fail)?;
+            // Polymorfa is trusted to report identity changes (README), so
+            // its report also releases the account's pin: the next primary
+            // identity seen is pinned in its place.
+            ops.forget_account_identity(&user).await.map_err(fail)?;
             respond(Out::Ok(proto::Ok {}))
         }
         Op::MigratePnToLid(request) => {
@@ -255,6 +262,8 @@ async fn receive(
             ciphertext: &receive.ciphertext,
             padding_version,
             is_from_me: receive.is_from_me,
+            device_identity: (!receive.device_identity.is_empty())
+                .then_some(receive.device_identity.as_slice()),
         })
         .await
         .map_err(|e| {
@@ -343,6 +352,21 @@ async fn receive(
     }))
 }
 
+/// The application event ID for a received payload. The receipt key keys
+/// the connection's own decrypt buffer and is identical for every connection that
+/// receives the same ciphertext (two connections in one group), so the event ID
+/// also binds the connection: acknowledging one connection's event never completes
+/// another's. Stable across redelivery to the same connection.
+pub fn event_id(connection_id: &str, receipt_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"signal-node app event v1\0");
+    hash.update((connection_id.len() as u64).to_be_bytes());
+    hash.update(connection_id.as_bytes());
+    hash.update(receipt_key.as_bytes());
+    hex::encode(hash.finalize())
+}
+
 /// The application event for a received message, or `None` when the
 /// message is protocol-only (sender keys, app-state keys, peer data
 /// operations) or is history and history delivery is off.
@@ -356,8 +380,9 @@ fn event_for(
     if content.is_skdm_only {
         return None;
     }
+    let id = event_id(&connection.id, &received.receipt_key);
     let base = |kind: &'static str| Event {
-        id: received.receipt_key.clone(),
+        id: id.clone(),
         kind,
         connection_id: connection.id.clone(),
         chat: receive.chat.clone(),
@@ -451,4 +476,20 @@ pub async fn uploaded_prekey_count(
         .uploaded_prekey_count()
         .await
         .map_err(|error| node.ops_error(connection, &error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_id;
+
+    #[test]
+    fn event_ids_are_stable_per_connection_and_distinct_across_connections() {
+        let receipt = "same-group-ciphertext";
+        assert_eq!(event_id("alpha", receipt), event_id("alpha", receipt));
+        assert_ne!(event_id("alpha", receipt), event_id("beta", receipt));
+        assert_ne!(event_id("alpha", receipt), event_id("alpha", "other"));
+        // Length-prefixing the connection keeps ("ab", "c…") apart from ("a", "bc…").
+        assert_ne!(event_id("ab", "cd"), event_id("a", "bcd"));
+        assert_eq!(event_id("alpha", receipt).len(), 64);
+    }
 }
