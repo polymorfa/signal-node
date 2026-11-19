@@ -7,7 +7,7 @@
 //! Error messages name the failure, never content or key material.
 
 use crate::message::{self, Event};
-use crate::node::{ActiveSession, Node};
+use crate::node::{ActiveConnection, Node};
 use crate::proto::{
     self, Code, DecryptFailure, Identity, MigrateResult, PreKey, PreKeyCount, PreKeyUploadBatch,
     PreKeys, ReceiveResult, ServiceResponse, SignedPairing, Stanza, runner_request::Op,
@@ -42,14 +42,14 @@ fn jid(value: &str, field: &str) -> Result<Jid, proto::Error> {
 
 pub async fn handle(
     node: &Node,
-    session: &Arc<ActiveSession>,
+    connection: &Arc<ActiveConnection>,
     op: Op,
 ) -> Result<ServiceResponse, proto::Error> {
     if let Op::GetIdentity(_) = op {
-        let ops = session
+        let ops = connection
             .ops_or_create()
             .await
-            .map_err(|e| node.ops_error(session, &e))?;
+            .map_err(|e| node.ops_error(connection, &e))?;
         let identity = ops.public_identity().await;
         return respond(Out::Identity(Identity {
             registration_id: identity.registration_id,
@@ -60,16 +60,16 @@ pub async fn handle(
             adv_secret: identity.adv_secret.to_vec(),
         }));
     }
-    let Some(ops) = session.ops() else {
+    let Some(ops) = connection.ops() else {
         return Err(proto::Error::new(
-            Code::SessionUnavailable,
+            Code::ConnectionUnavailable,
             "device keys do not exist yet; GetIdentity creates them",
         ));
     };
-    let fail = |e: OpsError| node.ops_error(session, &e);
+    let fail = |e: OpsError| node.ops_error(connection, &e);
     match op {
         Op::GetIdentity(_) => unreachable!("handled above"),
-        Op::Receive(receive) => self::receive(node, session, &ops, receive).await,
+        Op::Receive(receive) => self::receive(node, connection, &ops, receive).await,
         Op::GeneratePreKeys(request) => {
             let keys = ops
                 .generate_prekeys(&TokioRuntime, request.count)
@@ -115,7 +115,7 @@ pub async fn handle(
             respond(Out::Ok(proto::Ok {}))
         }
         Op::UploadedPreKeyCount(_) => {
-            let count = uploaded_prekey_count(node, session).await?;
+            let count = uploaded_prekey_count(node, connection).await?;
             respond(Out::PreKeyCount(PreKeyCount { count }))
         }
         Op::SignPairing(request) => {
@@ -169,8 +169,8 @@ pub async fn handle(
             };
             let resolver = RemoteResolver {
                 link,
-                session_id: session.id.clone(),
-                generation: session.generation,
+                connection_id: connection.id.clone(),
+                generation: connection.generation,
             };
             let node_bytes = ops
                 .resend(
@@ -210,9 +210,9 @@ pub async fn handle(
 }
 
 /// Map a receive failure to the contract's decrypt failures.
-pub fn receive_error(node: &Node, session: &ActiveSession, error: &OpsError) -> proto::Error {
+pub fn receive_error(node: &Node, connection: &ActiveConnection, error: &OpsError) -> proto::Error {
     if error.is_fence_lost() {
-        return node.ops_error(session, error);
+        return node.ops_error(connection, error);
     }
     match error {
         OpsError::Store(_) | OpsError::Signal(SignalProtocolError::BackendError(..)) => {
@@ -233,14 +233,14 @@ pub fn receive_error(node: &Node, session: &ActiveSession, error: &OpsError) -> 
                 "decrypted payload is not a message",
             )
         }
-        OpsError::NotInitialised => node.ops_error(session, error),
+        OpsError::NotInitialised => node.ops_error(connection, error),
         _ => proto::Error::decrypt_failed(DecryptFailure::Unspecified, "decryption failed"),
     }
 }
 
 async fn receive(
     node: &Node,
-    session: &Arc<ActiveSession>,
+    connection: &Arc<ActiveConnection>,
     ops: &crate::node::Ops,
     receive: proto::Receive,
 ) -> Result<ServiceResponse, proto::Error> {
@@ -267,9 +267,9 @@ async fn receive(
         })
         .await
         .map_err(|e| {
-            let error = receive_error(node, session, &e);
+            let error = receive_error(node, connection, &e);
             tracing::info!(
-                session = %session.id,
+                connection = %connection.id,
                 message_id = %receive.message_id,
                 kind = %receive.kind,
                 code = error.code_enum().as_str_name(),
@@ -282,14 +282,14 @@ async fn receive(
             let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
                 let cutoff = crate::node::now_ms()
                     .saturating_sub(node.cfg.decrypt_buffer_retention.as_millis() as u64);
-                session
+                connection
                     .replay_app_state_share(&receipt_key, cutoff)
                     .await
-                    .map_err(|e| node.ops_error(session, &e))?
+                    .map_err(|e| node.ops_error(connection, &e))?
             } else {
                 Vec::new()
             };
-            if !session.can_serve().await {
+            if !connection.can_serve().await {
                 return Err(proto::Error::new(
                     Code::NotLeaseHolder,
                     "the lease expired before receive replay",
@@ -314,20 +314,20 @@ async fn receive(
     } else {
         Vec::new()
     };
-    if let Some(event) = event_for(node, session, &receive, &message) {
+    if let Some(event) = event_for(node, connection, &receive, &message) {
         let kind = event.kind;
         if let Err(e) = node.delivery.deliver(event).await {
             tracing::info!(
-                session = %session.id,
+                connection = %connection.id,
                 message_id = %receive.message_id,
                 error = %e,
                 "delivery not acknowledged; the message stays sealed in the buffer for redelivery"
             );
             return Err(proto::Error::new(Code::Unavailable, e.to_string()));
         }
-        tracing::debug!(session = %session.id, message_id = %receive.message_id, kind, "delivered");
+        tracing::debug!(connection = %connection.id, message_id = %receive.message_id, kind, "delivered");
     }
-    if !session.can_serve().await {
+    if !connection.can_serve().await {
         return Err(proto::Error::new(
             Code::NotLeaseHolder,
             "the lease expired before delivery was recorded",
@@ -336,14 +336,14 @@ async fn receive(
     // The runner has not acknowledged this response. Preserve only the share
     // before dropping buffered plaintext, so a lost reply remains replayable.
     if !app_state_key_share.is_empty() {
-        session
+        connection
             .save_app_state_share(&message.receipt_key, &app_state_key_share)
             .await
-            .map_err(|e| node.ops_error(session, &e))?;
+            .map_err(|e| node.ops_error(connection, &e))?;
     }
     ops.mark_delivered(&message.receipt_key)
         .await
-        .map_err(|e| node.ops_error(session, &e))?;
+        .map_err(|e| node.ops_error(connection, &e))?;
     respond(Out::Receive(ReceiveResult {
         already_delivered: false,
         redelivered: message.redelivered,
@@ -353,16 +353,16 @@ async fn receive(
 }
 
 /// The application event ID for a received payload. The receipt key keys
-/// the session's own decrypt buffer and is identical for every session that
-/// receives the same ciphertext (two sessions in one group), so the event ID
-/// also binds the session: acknowledging one session's event never completes
-/// another's. Stable across redelivery to the same session.
-pub fn event_id(session_id: &str, receipt_key: &str) -> String {
+/// the connection's own decrypt buffer and is identical for every connection that
+/// receives the same ciphertext (two connections in one group), so the event ID
+/// also binds the connection: acknowledging one connection's event never completes
+/// another's. Stable across redelivery to the same connection.
+pub fn event_id(connection_id: &str, receipt_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(b"signal-node app event v1\0");
-    hash.update((session_id.len() as u64).to_be_bytes());
-    hash.update(session_id.as_bytes());
+    hash.update((connection_id.len() as u64).to_be_bytes());
+    hash.update(connection_id.as_bytes());
     hash.update(receipt_key.as_bytes());
     hex::encode(hash.finalize())
 }
@@ -372,7 +372,7 @@ pub fn event_id(session_id: &str, receipt_key: &str) -> String {
 /// operations) or is history and history delivery is off.
 fn event_for(
     node: &Node,
-    session: &ActiveSession,
+    connection: &ActiveConnection,
     receive: &proto::Receive,
     received: &wacore_signal_ops::ReceivedMessage,
 ) -> Option<Event> {
@@ -380,11 +380,11 @@ fn event_for(
     if content.is_skdm_only {
         return None;
     }
-    let id = event_id(&session.id, &received.receipt_key);
+    let id = event_id(&connection.id, &received.receipt_key);
     let base = |kind: &'static str| Event {
         id: id.clone(),
         kind,
-        session_id: session.id.clone(),
+        connection_id: connection.id.clone(),
         chat: receive.chat.clone(),
         sender: receive.sender.clone(),
         sender_alt: Some(receive.sender_alt.clone()).filter(|s| !s.is_empty()),
@@ -428,7 +428,7 @@ fn event_for(
         {
             // History comes only from this account's own devices.
             if !node.cfg.deliver_history || !receive.is_from_me {
-                tracing::debug!(session = %session.id, "history notification not delivered (history delivery is off)");
+                tracing::debug!(connection = %connection.id, "history notification not delivered (history delivery is off)");
                 return None;
             }
             return Some(Event {
@@ -470,12 +470,12 @@ fn base64_of(bytes: &[u8]) -> String {
 /// Surviving uploaded keys in customer-local state, not a provider pool count.
 pub async fn uploaded_prekey_count(
     node: &Node,
-    session: &ActiveSession,
+    connection: &ActiveConnection,
 ) -> Result<u32, proto::Error> {
-    session
+    connection
         .uploaded_prekey_count()
         .await
-        .map_err(|error| node.ops_error(session, &error))
+        .map_err(|error| node.ops_error(connection, &error))
 }
 
 #[cfg(test)]
@@ -483,12 +483,12 @@ mod tests {
     use super::event_id;
 
     #[test]
-    fn event_ids_are_stable_per_session_and_distinct_across_sessions() {
+    fn event_ids_are_stable_per_connection_and_distinct_across_connections() {
         let receipt = "same-group-ciphertext";
         assert_eq!(event_id("alpha", receipt), event_id("alpha", receipt));
         assert_ne!(event_id("alpha", receipt), event_id("beta", receipt));
         assert_ne!(event_id("alpha", receipt), event_id("alpha", "other"));
-        // Length-prefixing the session keeps ("ab", "c…") apart from ("a", "bc…").
+        // Length-prefixing the connection keeps ("ab", "c…") apart from ("a", "bc…").
         assert_ne!(event_id("ab", "cd"), event_id("a", "bcd"));
         assert_eq!(event_id("alpha", receipt).len(), 64);
     }

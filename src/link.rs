@@ -8,7 +8,7 @@
 //! failure the link reconnects with jittered exponential backoff.
 
 use crate::proto::{
-    self, Code, Frame, Hello, RunnerRequest, ServiceRequest, ServiceResponse, SessionEvent,
+    self, Code, ConnectionEvent, Frame, Hello, RunnerRequest, ServiceRequest, ServiceResponse,
     Welcome, frame::Body, runner_response, service_request,
 };
 use async_trait::async_trait;
@@ -113,7 +113,7 @@ impl Link {
     /// Send a request and wait for its response.
     pub async fn request(
         &self,
-        session_id: &str,
+        connection_id: &str,
         lease_generation: u64,
         op: service_request::Op,
     ) -> Result<runner_response::Result, LinkError> {
@@ -126,7 +126,7 @@ impl Link {
         let frame = Frame::with(
             id,
             Body::ServiceRequest(ServiceRequest {
-                session_id: session_id.to_owned(),
+                connection_id: connection_id.to_owned(),
                 lease_generation,
                 op: Some(op),
             }),
@@ -169,7 +169,7 @@ pub trait Handler: Send + Sync + 'static {
     -> Result<ServiceResponse, proto::Error>;
     /// `origin` is the link that delivered the event; a handler must ignore
     /// events from a link that is no longer current.
-    async fn session_event(&self, event: SessionEvent, origin: Arc<Link>);
+    async fn connection_event(&self, event: ConnectionEvent, origin: Arc<Link>);
     /// A link finished its handshake. Claims go out from here.
     async fn connected(&self, link: Arc<Link>);
     async fn disconnected(&self);
@@ -434,10 +434,10 @@ async fn dispatch(link: &Arc<Link>, handler: &Arc<dyn Handler>, frame: Frame) {
                 link.complete(id, Err(error)).await;
             }
         }
-        Some(Body::SessionEvent(event)) => {
+        Some(Body::ConnectionEvent(event)) => {
             let handler = handler.clone();
             let origin = link.clone();
-            tokio::spawn(async move { handler.session_event(event, origin).await });
+            tokio::spawn(async move { handler.connection_event(event, origin).await });
         }
         Some(Body::Welcome(_)) => {}
         Some(Body::Hello(_) | Body::ServiceRequest(_) | Body::ServiceResponse(_)) => {

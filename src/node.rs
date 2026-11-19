@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The node: which sessions it holds, its link to Polymorfa, and the loops
+//! The node: which connections it holds, its link to Polymorfa, and the loops
 //! that keep both current.
 //!
-//! Every configured session is tried on each lease tick. A node serves a
-//! session only while it holds the session's lease in the shared store.
-//! Holding the lease, it claims the session from Polymorfa at that lease's
+//! Every configured connection is tried on each lease tick. A node serves a
+//! connection only while it holds the connection's lease in the shared store.
+//! Holding the lease, it claims the connection from Polymorfa at that lease's
 //! generation; Polymorfa routes to the highest generation it accepted. If
 //! the node stops renewing (crash, partition), the lease expires and another
 //! node takes it at a higher generation. Any write the old node still
@@ -16,8 +16,8 @@ use crate::delivery::{Delivery, Webhook};
 use crate::keys::MasterKey;
 use crate::link::{self, Handler, Link, LinkError, LinkSettings};
 use crate::proto::{
-    self, ClaimSession, Code, ReleaseSession, RunnerRequest, ServiceResponse, SessionEvent,
-    runner_response, service_request, session_event::State,
+    self, ClaimConnection, Code, ConnectionEvent, ReleaseConnection, RunnerRequest,
+    ServiceResponse, connection_event::State, runner_response, service_request,
 };
 use crate::ratelimit::SendLimiter;
 use crate::share_replay::ShareReplay;
@@ -41,9 +41,9 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// What the application sees about a session on this node.
+/// What the application sees about a connection on this node.
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct SessionView {
+pub struct ConnectionView {
     pub state: String,
     pub pn: Option<String>,
     pub lid: Option<String>,
@@ -57,8 +57,8 @@ fn state_name(state: i32) -> String {
         .to_ascii_lowercase()
 }
 
-/// A session this node holds the lease for.
-pub struct ActiveSession {
+/// A connection this node holds the lease for.
+pub struct ActiveConnection {
     pub id: String,
     pub generation: u64,
     lease: Mutex<Lease>,
@@ -69,10 +69,10 @@ pub struct ActiveSession {
     claiming: AtomicBool,
     lost: AtomicBool,
     pub limiter: SendLimiter,
-    view: RwLock<SessionView>,
+    view: RwLock<ConnectionView>,
 }
 
-impl ActiveSession {
+impl ActiveConnection {
     /// The Signal operations, if the device keys exist.
     pub fn ops(&self) -> Option<Arc<Ops>> {
         self.ops.get().cloned()
@@ -129,7 +129,7 @@ impl ActiveSession {
         !self.is_lost() && now_ms() < self.lease.lock().await.expires_at_ms
     }
 
-    pub fn view(&self) -> SessionView {
+    pub fn view(&self) -> ConnectionView {
         self.view.read().expect("view lock").clone()
     }
 
@@ -156,8 +156,8 @@ pub struct Node {
     master: MasterKey,
     /// Unique process incarnation; stable diagnostic node IDs cannot share a fence.
     lease_holder: String,
-    sessions: RwLock<HashMap<String, Arc<ActiveSession>>>,
-    /// Sessions Polymorfa reported logged out; not taken again until restart.
+    connections: RwLock<HashMap<String, Arc<ActiveConnection>>>,
+    /// Connections Polymorfa reported logged out; not taken again until restart.
     retired: RwLock<HashSet<String>>,
     /// Highest generation this process stopped serving without a confirmed
     /// release. A reacquired lease at or below it shares the old fence, so it is
@@ -185,7 +185,7 @@ impl Node {
             ),
             cfg: Arc::new(cfg),
             backend: Arc::new(backend),
-            sessions: RwLock::new(HashMap::new()),
+            connections: RwLock::new(HashMap::new()),
             retired: RwLock::new(HashSet::new()),
             abandoned: RwLock::new(HashMap::new()),
             link: RwLock::new(None),
@@ -198,19 +198,19 @@ impl Node {
         &self.backend
     }
 
-    pub fn session(&self, id: &str) -> Option<Arc<ActiveSession>> {
-        self.sessions
+    pub fn connection(&self, id: &str) -> Option<Arc<ActiveConnection>> {
+        self.connections
             .read()
-            .expect("sessions lock")
+            .expect("connections lock")
             .get(id)
             .cloned()
     }
 
-    pub fn sessions(&self) -> Vec<Arc<ActiveSession>> {
+    pub fn connections(&self) -> Vec<Arc<ActiveConnection>> {
         let mut all: Vec<_> = self
-            .sessions
+            .connections
             .read()
-            .expect("sessions lock")
+            .expect("connections lock")
             .values()
             .cloned()
             .collect();
@@ -219,7 +219,7 @@ impl Node {
     }
 
     pub fn is_configured(&self, id: &str) -> bool {
-        self.cfg.sessions.iter().any(|s| s == id)
+        self.cfg.connections.iter().any(|s| s == id)
     }
 
     pub fn link(&self) -> Option<Arc<Link>> {
@@ -238,70 +238,71 @@ impl Node {
     /// released: it is no longer ours.
     pub fn lose(&self, id: &str, generation: u64, why: &str) {
         let removed = {
-            let mut sessions = self.sessions.write().expect("sessions lock");
-            let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+            let mut connections = self.connections.write().expect("connections lock");
+            let Some(connection) = connections.get(id).filter(|s| s.generation == generation)
+            else {
                 return;
             };
             // A lease tick must see the refused fence before the missing
-            // session, even when the later durable release fails.
-            session.lost.store(true, Ordering::SeqCst);
+            // connection, even when the later durable release fails.
+            connection.lost.store(true, Ordering::SeqCst);
             self.remember_abandoned(id, generation);
-            sessions.remove(id)
+            connections.remove(id)
         };
-        if let Some(session) = removed {
+        if let Some(connection) = removed {
             tracing::warn!(
-                session = id,
-                generation = session.generation,
+                connection = id,
+                generation = connection.generation,
                 reason = why,
-                "stopped serving session"
+                "stopped serving connection"
             );
         }
     }
 
-    /// Give a session up voluntarily: tell Polymorfa, then release the lease
+    /// Give a connection up voluntarily: tell Polymorfa, then release the lease
     /// so another node can take it at once.
     pub async fn release(&self, id: &str) {
         let removed = {
-            let mut sessions = self.sessions.write().expect("sessions lock");
-            let removed = sessions.remove(id);
-            if let Some(session) = &removed {
-                session.lost.store(true, Ordering::SeqCst);
+            let mut connections = self.connections.write().expect("connections lock");
+            let removed = connections.remove(id);
+            if let Some(connection) = &removed {
+                connection.lost.store(true, Ordering::SeqCst);
                 // Publish the refusal before a lease tick can observe the
-                // missing session, and before either release can suspend.
-                self.remember_abandoned(id, session.generation);
+                // missing connection, and before either release can suspend.
+                self.remember_abandoned(id, connection.generation);
             }
             removed
         };
-        let Some(session) = removed else { return };
+        let Some(connection) = removed else { return };
         if let Some(link) = self.link()
-            && session.is_claimed()
+            && connection.is_claimed()
         {
-            let op = service_request::Op::ReleaseSession(ReleaseSession {});
-            if let Err(e) = link.request(id, session.generation, op).await {
-                tracing::debug!(session = id, error = %e, "ReleaseSession was not acknowledged");
+            let op = service_request::Op::ReleaseConnection(ReleaseConnection {});
+            if let Err(e) = link.request(id, connection.generation, op).await {
+                tracing::debug!(connection = id, error = %e, "ReleaseConnection was not acknowledged");
             }
         }
-        let lease = session.lease().await;
+        let lease = connection.lease().await;
         self.abandon(id, &lease).await;
         tracing::info!(
-            session = id,
-            generation = session.generation,
-            "released session"
+            connection = id,
+            generation = connection.generation,
+            "released connection"
         );
     }
 
-    /// Map an operation error to a contract error, dropping the session if
+    /// Map an operation error to a contract error, dropping the connection if
     /// the store says another node took it.
-    pub fn ops_error(&self, session: &ActiveSession, error: &OpsError) -> proto::Error {
+    pub fn ops_error(&self, connection: &ActiveConnection, error: &OpsError) -> proto::Error {
         if error.is_fence_lost() {
             self.lose(
-                &session.id,
-                session.generation,
+                &connection.id,
+                connection.generation,
                 "store refused a write: lease moved to another node",
             );
             return proto::Error::new(
                 Code::NotLeaseHolder,
-                "this node no longer holds the session",
+                "this node no longer holds the connection",
             );
         }
         match error {
@@ -310,7 +311,7 @@ impl Node {
                 proto::Error::new(Code::InvalidArgument, message.clone())
             }
             OpsError::NotInitialised => proto::Error::new(
-                Code::SessionUnavailable,
+                Code::ConnectionUnavailable,
                 "device keys do not exist yet; GetIdentity creates them",
             ),
             OpsError::Pairing { code, text } => proto::Error::new(
@@ -326,7 +327,7 @@ impl Node {
         }
     }
 
-    async fn activate(&self, lease: Lease) -> anyhow::Result<Arc<ActiveSession>> {
+    async fn activate(&self, lease: Lease) -> anyhow::Result<Arc<ActiveConnection>> {
         let data_key = self
             .master
             .data_key_for(self.backend.as_ref(), &lease.fence)
@@ -344,9 +345,13 @@ impl Node {
                 let _ = ops.set(Arc::new(opened));
             }
             Err(OpsError::NotInitialised) => {}
-            Err(e) => return Err(anyhow::anyhow!("opening the session's Signal state: {e}")),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "opening the connection's Signal state: {e}"
+                ));
+            }
         }
-        Ok(Arc::new(ActiveSession {
+        Ok(Arc::new(ActiveConnection {
             id: lease.fence.scope.to_string(),
             generation: lease.fence.generation,
             lease: Mutex::new(lease),
@@ -357,7 +362,7 @@ impl Node {
             claiming: AtomicBool::new(false),
             lost: AtomicBool::new(false),
             limiter: SendLimiter::new(),
-            view: RwLock::new(SessionView {
+            view: RwLock::new(ConnectionView {
                 state: "unclaimed".into(),
                 ..Default::default()
             }),
@@ -366,8 +371,13 @@ impl Node {
 
     /// Publish only while the connection that began acquisition is current.
     /// Holding the link read lock through insertion orders publication before
-    /// disconnect's link removal and subsequent session snapshot.
-    fn publish_acquired(&self, id: &str, session: Arc<ActiveSession>, origin: &Arc<Link>) -> bool {
+    /// disconnect's link removal and subsequent connection snapshot.
+    fn publish_acquired(
+        &self,
+        id: &str,
+        connection: Arc<ActiveConnection>,
+        origin: &Arc<Link>,
+    ) -> bool {
         let current = self.link.read().expect("link lock");
         if *self.shutdown.borrow()
             || !current
@@ -376,47 +386,47 @@ impl Node {
         {
             return false;
         }
-        self.sessions
+        self.connections
             .write()
-            .expect("sessions lock")
-            .insert(id.to_owned(), session);
+            .expect("connections lock")
+            .insert(id.to_owned(), connection);
         true
     }
 
-    /// One pass over every configured session: renew what we hold, try to
+    /// One pass over every configured connection: renew what we hold, try to
     /// take what is free, and claim anything Polymorfa has not accepted yet.
     pub async fn tick_leases(self: &Arc<Self>) {
         let ttl = self.cfg.lease_ttl_ms;
-        for id in &self.cfg.sessions {
+        for id in &self.cfg.connections {
             if *self.shutdown.borrow() {
                 return;
             }
             if self.retired.read().expect("retired lock").contains(id) {
                 continue;
             }
-            match self.session(id) {
-                Some(session) => {
-                    let lease = session.lease().await;
+            match self.connection(id) {
+                Some(connection) => {
+                    let lease = connection.lease().await;
                     let now = now_ms();
                     if now >= lease.expires_at_ms {
-                        self.lose(id, session.generation, "lease expired before renewal");
+                        self.lose(id, connection.generation, "lease expired before renewal");
                         self.abandon(id, &lease).await;
                         continue;
                     }
                     match self.backend.renew(&lease, now, ttl).await {
-                        Ok(Some(renewed)) => *session.lease.lock().await = renewed,
+                        Ok(Some(renewed)) => *connection.lease.lock().await = renewed,
                         Ok(None) => {
-                            self.lose(id, session.generation, "lease taken over");
+                            self.lose(id, connection.generation, "lease taken over");
                             continue;
                         }
                         Err(e) => {
-                            tracing::warn!(session = %id, error = %e, "lease renewal failed");
+                            tracing::warn!(connection = %id, error = %e, "lease renewal failed");
                             // Stop before another node can take it.
                             let margin = self.cfg.lease_renew.as_millis() as u64;
                             if now.saturating_add(margin) >= lease.expires_at_ms {
                                 self.lose(
                                     id,
-                                    session.generation,
+                                    connection.generation,
                                     "lease could not be renewed before it expired",
                                 );
                                 self.abandon(id, &lease).await;
@@ -424,8 +434,8 @@ impl Node {
                             }
                         }
                     }
-                    if !session.is_claimed() {
-                        self.spawn_claim(session);
+                    if !connection.is_claimed() {
+                        self.spawn_claim(connection);
                     }
                 }
                 None => {
@@ -448,41 +458,43 @@ impl Node {
                                 // Same holder, same fence: release so the next
                                 // acquisition increments the generation.
                                 if self.backend.release(&lease).await.is_ok() {
-                                    tracing::info!(session = %id, generation, "released an abandoned fence before reacquiring");
+                                    tracing::info!(connection = %id, generation, "released an abandoned fence before reacquiring");
                                 }
                                 continue;
                             }
                             match self.activate(lease.clone()).await {
-                                Ok(session) => {
-                                    if !self.publish_acquired(id, session.clone(), &origin) {
+                                Ok(connection) => {
+                                    if !self.publish_acquired(id, connection.clone(), &origin) {
                                         self.abandon(id, &lease).await;
                                         continue;
                                     }
-                                    tracing::info!(session = %id, generation, "took session lease");
-                                    self.spawn_claim(session);
+                                    tracing::info!(connection = %id, generation, "took connection lease");
+                                    self.spawn_claim(connection);
                                 }
                                 Err(e) => {
-                                    tracing::error!(session = %id, error = %e, "cannot serve session; releasing its lease");
+                                    tracing::error!(connection = %id, error = %e, "cannot serve connection; releasing its lease");
                                     self.abandon(id, &lease).await;
                                 }
                             }
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!(session = %id, error = %e, "lease acquire failed"),
+                        Err(e) => {
+                            tracing::warn!(connection = %id, error = %e, "lease acquire failed")
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Polymorfa refused this session's generation, for example after a
+    /// Polymorfa refused this connection's generation, for example after a
     /// runner-side pause. Stop serving it and release the durable lease, so the
     /// next acquisition claims a strictly higher generation instead of
     /// retrying the refused one forever.
-    pub(crate) async fn refused_generation(&self, session: &ActiveSession, why: &str) {
-        let lease = session.lease().await;
-        self.lose(&session.id, session.generation, why);
-        self.abandon(&session.id, &lease).await;
+    pub(crate) async fn refused_generation(&self, connection: &ActiveConnection, why: &str) {
+        let lease = connection.lease().await;
+        self.lose(&connection.id, connection.generation, why);
+        self.abandon(&connection.id, &lease).await;
     }
 
     /// Stop owning `lease` after serving stopped without a renewal. Release it so
@@ -492,7 +504,7 @@ impl Node {
         let generation = lease.fence.generation;
         self.remember_abandoned(id, generation);
         if let Err(e) = self.backend.release(lease).await {
-            tracing::warn!(session = id, generation, error = %e, "abandoned lease release failed; its fence stays refused");
+            tracing::warn!(connection = id, generation, error = %e, "abandoned lease release failed; its fence stays refused");
         }
     }
 
@@ -502,67 +514,69 @@ impl Node {
         *entry = (*entry).max(generation);
     }
 
-    fn spawn_claim(&self, session: Arc<ActiveSession>) {
+    fn spawn_claim(&self, connection: Arc<ActiveConnection>) {
         let Some(link) = self.link() else { return };
         let Some(node) = self.me.upgrade() else {
             return;
         };
-        if session.claiming.swap(true, Ordering::SeqCst) {
+        if connection.claiming.swap(true, Ordering::SeqCst) {
             return;
         }
         tokio::spawn(async move {
-            node.claim(&session, &link).await;
-            session.claiming.store(false, Ordering::SeqCst);
+            node.claim(&connection, &link).await;
+            connection.claiming.store(false, Ordering::SeqCst);
         });
     }
 
-    async fn claim(&self, session: &Arc<ActiveSession>, link: &Arc<Link>) {
-        if !session.can_serve().await {
+    async fn claim(&self, connection: &Arc<ActiveConnection>, link: &Arc<Link>) {
+        if !connection.can_serve().await {
             return;
         }
-        let op = service_request::Op::ClaimSession(ClaimSession {
-            generation: session.generation,
+        let op = service_request::Op::ClaimConnection(ClaimConnection {
+            generation: connection.generation,
         });
-        match link.request(&session.id, 0, op).await {
-            Ok(runner_response::Result::SessionClaimed(claimed)) => {
-                if !session.can_serve().await {
+        match link.request(&connection.id, 0, op).await {
+            Ok(runner_response::Result::ConnectionClaimed(claimed)) => {
+                if !connection.can_serve().await {
                     return;
                 }
-                session.claimed.store(true, Ordering::SeqCst);
-                session.set_view(claimed.state, &claimed.pn, &claimed.lid);
+                connection.claimed.store(true, Ordering::SeqCst);
+                connection.set_view(claimed.state, &claimed.pn, &claimed.lid);
                 tracing::info!(
-                    session = %session.id,
-                    generation = session.generation,
+                    connection = %connection.id,
+                    generation = connection.generation,
                     state = %state_name(claimed.state),
                     "Polymorfa accepted the claim"
                 );
                 if claimed.state == State::LoggedOut as i32 {
-                    self.retire(&session.id).await;
+                    self.retire(&connection.id).await;
                     return;
                 }
                 if !claimed.pn.is_empty()
-                    && let Some(ops) = session.ops()
+                    && let Some(ops) = connection.ops()
                 {
                     let lid = Some(claimed.lid.as_str()).filter(|l| !l.is_empty());
                     if let Err(e) = ops.set_own_jids(&claimed.pn, lid).await {
-                        let error = self.ops_error(session, &e);
-                        tracing::warn!(session = %session.id, error = %error, "could not record own JIDs");
+                        let error = self.ops_error(connection, &e);
+                        tracing::warn!(connection = %connection.id, error = %error, "could not record own JIDs");
                     }
                 }
             }
-            Ok(_) => tracing::warn!(session = %session.id, "unexpected answer to ClaimSession"),
+            Ok(_) => {
+                tracing::warn!(connection = %connection.id, "unexpected answer to ClaimConnection")
+            }
             Err(LinkError::Remote(error)) => match error.code_enum() {
                 Code::NotLeaseHolder => {
-                    self.refused_generation(session, "Polymorfa refused this claim generation")
+                    self.refused_generation(connection, "Polymorfa refused this claim generation")
                         .await;
                 }
-                Code::SessionUnavailable => tracing::warn!(
-                    session = %session.id,
-                    "Polymorfa refused the claim: the session is not in this project or is logged out"
+                Code::ConnectionUnavailable => tracing::warn!(
+                    connection = %connection.id,
+                    "Polymorfa refused the claim: the connection is not in this project or is logged out"
                 ),
-                _ => tracing::warn!(session = %session.id, error = %error, "claim refused"),
+                _ => tracing::warn!(connection = %connection.id, error = %error, "claim refused"),
             },
-            Err(e) => tracing::warn!(session = %session.id, error = %e, "claim failed"),
+            Err(e) => tracing::warn!(connection = %connection.id, error = %e, "claim failed"),
         }
     }
 
@@ -572,8 +586,8 @@ impl Node {
             .expect("retired lock")
             .insert(id.to_owned());
         tracing::warn!(
-            session = id,
-            "session is logged out; stopped serving it. Its sealed state is kept; remove it from the configuration and delete its records when no longer needed"
+            connection = id,
+            "connection is logged out; stopped serving it. Its sealed state is kept; remove it from the configuration and delete its records when no longer needed"
         );
         self.release(id).await;
     }
@@ -583,26 +597,28 @@ impl Node {
         let buffer_cutoff =
             now.saturating_sub(self.cfg.decrypt_buffer_retention.as_millis() as u64);
         let sent_cutoff = now.saturating_sub(self.cfg.sent_message_retention.as_millis() as u64);
-        for session in self.sessions() {
-            if !session.can_serve().await {
+        for connection in self.connections() {
+            if !connection.can_serve().await {
                 continue;
             }
-            let Some(ops) = session.ops() else { continue };
+            let Some(ops) = connection.ops() else {
+                continue;
+            };
             let result = async {
                 let buffered = ops.prune_decrypt_buffer(buffer_cutoff).await?;
                 let sent = ops.prune_sent_messages(sent_cutoff).await?;
-                let shares = session.shares.prune(buffer_cutoff).await?;
+                let shares = connection.shares.prune(buffer_cutoff).await?;
                 Ok::<_, OpsError>((buffered, sent, shares))
             }
             .await;
             match result {
                 Ok((buffered, sent, shares)) if buffered + sent + shares > 0 => {
-                    tracing::info!(session = %session.id, buffered, sent, shares, "pruned expired records")
+                    tracing::info!(connection = %connection.id, buffered, sent, shares, "pruned expired records")
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    let error = self.ops_error(&session, &e);
-                    tracing::warn!(session = %session.id, error = %error, "pruning failed");
+                    let error = self.ops_error(&connection, &e);
+                    tracing::warn!(connection = %connection.id, error = %error, "pruning failed");
                 }
             }
         }
@@ -654,15 +670,15 @@ impl Node {
         vec![link_task, leases, pruner]
     }
 
-    /// Release every session, then stop the loops.
+    /// Release every connection, then stop the loops.
     pub async fn shutdown(&self) {
-        // Prevent renewal/reacquisition while releasing sessions. Socket closure
-        // removes routing claims even if ReleaseSession races the stop signal.
+        // Prevent renewal/reacquisition while releasing connections. Socket closure
+        // removes routing claims even if ReleaseConnection races the stop signal.
         self.shutdown.send_replace(true);
         // Wait for publications that read the previous flag before taking the
-        // session snapshot. Later publications observe shutdown and refuse.
+        // connection snapshot. Later publications observe shutdown and refuse.
         drop(self.link.write().expect("link lock"));
-        let ids: Vec<String> = self.sessions().iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<String> = self.connections().iter().map(|s| s.id.clone()).collect();
         for id in ids {
             self.release(&id).await;
         }
@@ -675,48 +691,48 @@ impl Handler for Node {
         &self,
         request: RunnerRequest,
     ) -> Result<ServiceResponse, proto::Error> {
-        let Some(session) = self.session(&request.session_id) else {
+        let Some(connection) = self.connection(&request.connection_id) else {
             return Err(proto::Error::new(
                 Code::NotLeaseHolder,
-                "this node does not hold the session",
+                "this node does not hold the connection",
             ));
         };
-        if request.lease_generation != session.generation || !session.can_serve().await {
+        if request.lease_generation != connection.generation || !connection.can_serve().await {
             return Err(proto::Error::new(
                 Code::NotLeaseHolder,
                 format!(
                     "request generation {} is not this node's generation {}",
-                    request.lease_generation, session.generation
+                    request.lease_generation, connection.generation
                 ),
             ));
         }
         let Some(op) = request.op else {
             return Err(proto::Error::new(Code::Unsupported, "unknown operation"));
         };
-        crate::serve::handle(self, &session, op).await
+        crate::serve::handle(self, &connection, op).await
     }
 
-    async fn session_event(&self, event: SessionEvent, origin: Arc<Link>) {
+    async fn connection_event(&self, event: ConnectionEvent, origin: Arc<Link>) {
         // Events carry no generation. One from a replaced link describes the
         // old connection and must not retire or reclaim its successor.
         if !self
             .link()
             .is_some_and(|current| Arc::ptr_eq(&current, &origin))
         {
-            tracing::debug!(session = %event.session_id, "ignored a session event from a previous link");
+            tracing::debug!(connection = %event.connection_id, "ignored a connection event from a previous link");
             return;
         }
-        let Some(session) = self.session(&event.session_id) else {
+        let Some(connection) = self.connection(&event.connection_id) else {
             return;
         };
-        session.set_view(event.state, &event.pn, &event.lid);
-        tracing::info!(session = %session.id, state = %state_name(event.state), "session state changed");
+        connection.set_view(event.state, &event.pn, &event.lid);
+        tracing::info!(connection = %connection.id, state = %state_name(event.state), "connection state changed");
         match State::try_from(event.state).unwrap_or(State::Unspecified) {
-            State::LoggedOut => self.retire(&session.id).await,
+            State::LoggedOut => self.retire(&connection.id).await,
             // Polymorfa no longer routes to us; claim again.
             State::Paused => {
-                session.claimed.store(false, Ordering::SeqCst);
-                self.spawn_claim(session);
+                connection.claimed.store(false, Ordering::SeqCst);
+                self.spawn_claim(connection);
             }
             _ => {}
         }
@@ -724,8 +740,8 @@ impl Handler for Node {
 
     async fn connected(&self, link: Arc<Link>) {
         *self.link.write().expect("link lock") = Some(link);
-        for session in self.sessions() {
-            self.spawn_claim(session);
+        for connection in self.connections() {
+            self.spawn_claim(connection);
         }
     }
 
@@ -733,7 +749,7 @@ impl Handler for Node {
         *self.link.write().expect("link lock") = None;
         // A new socket must claim a strictly higher generation. Relinquish
         // these fences before reconnect so the durable store increments them.
-        let ids: Vec<_> = self.sessions().iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<_> = self.connections().iter().map(|s| s.id.clone()).collect();
         for id in ids {
             self.release(&id).await;
         }
@@ -748,7 +764,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use wacore_recordstore::MemoryRecordStore;
 
-    const SESSION: &str = "fixture-session";
+    const CONNECTION: &str = "fixture-session";
 
     fn node() -> Arc<Node> {
         let cfg = Config::from_toml(
@@ -757,7 +773,7 @@ node_id = "fixture-node"
 [polymorfa]
 url = "ws://127.0.0.1:1/signal"
 credential = "fixture-project-principal"
-sessions = ["fixture-session"]
+connections = ["fixture-session"]
 [storage]
 driver = "memory"
 master_key = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk="
@@ -772,39 +788,44 @@ secret = "fixture-application-secret"
         Node::new(cfg, Backend::Memory(Arc::new(MemoryRecordStore::new())))
     }
 
-    async fn acquired(node: &Node) -> (Lease, Arc<ActiveSession>) {
+    async fn acquired(node: &Node) -> (Lease, Arc<ActiveConnection>) {
         let lease = node
             .backend
-            .acquire(SESSION, &node.lease_holder, now_ms(), node.cfg.lease_ttl_ms)
+            .acquire(
+                CONNECTION,
+                &node.lease_holder,
+                now_ms(),
+                node.cfg.lease_ttl_ms,
+            )
             .await
             .unwrap()
             .unwrap();
-        let session = node.activate(lease.clone()).await.unwrap();
-        (lease, session)
+        let connection = node.activate(lease.clone()).await.unwrap();
+        (lease, connection)
     }
 
     #[tokio::test]
     async fn release_refuses_the_fence_before_waiting_for_storage() {
         let node = node();
-        let (lease, session) = acquired(&node).await;
-        node.sessions
+        let (lease, connection) = acquired(&node).await;
+        node.connections
             .write()
             .unwrap()
-            .insert(SESSION.into(), session.clone());
+            .insert(CONNECTION.into(), connection.clone());
         // Suspend release before durable storage can acknowledge it. Even if
         // that operation later fails, acquisition must already refuse the fence.
-        let held = session.lease.lock().await;
-        let mut release = std::pin::pin!(node.release(SESSION));
+        let held = connection.lease.lock().await;
+        let mut release = std::pin::pin!(node.release(CONNECTION));
         assert!(matches!(
             release
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Pending
         ));
-        assert!(session.is_lost());
-        assert!(node.session(SESSION).is_none());
+        assert!(connection.is_lost());
+        assert!(node.connection(CONNECTION).is_none());
         assert_eq!(
-            node.abandoned.read().unwrap().get(SESSION),
+            node.abandoned.read().unwrap().get(CONNECTION),
             Some(&lease.fence.generation)
         );
         drop(held);
@@ -814,49 +835,49 @@ secret = "fixture-application-secret"
     }
 
     #[tokio::test]
-    async fn losing_a_fence_records_refusal_before_exposing_a_missing_session() {
+    async fn losing_a_fence_records_refusal_before_exposing_a_missing_connection() {
         let node = node();
-        let (lease, session) = acquired(&node).await;
-        node.sessions
+        let (lease, connection) = acquired(&node).await;
+        node.connections
             .write()
             .unwrap()
-            .insert(SESSION.into(), session.clone());
+            .insert(CONNECTION.into(), connection.clone());
         let removal_is_locked = {
             let held = node.abandoned.write().unwrap();
             let losing = {
                 let node = node.clone();
                 std::thread::spawn(move || {
-                    node.lose(SESSION, lease.fence.generation, "fixture refusal")
+                    node.lose(CONNECTION, lease.fence.generation, "fixture refusal")
                 })
             };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !session.is_lost() {
+            while !connection.is_lost() {
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
                 std::thread::yield_now();
             }
             // Refusal is waiting for the held map. No lease tick may observe a
-            // missing session until that refusal has become visible.
-            let locked = session.is_lost() && node.sessions.try_read().is_err();
+            // missing connection until that refusal has become visible.
+            let locked = connection.is_lost() && node.connections.try_read().is_err();
             drop(held);
             losing.join().unwrap();
             locked
         };
         assert!(removal_is_locked);
-        assert!(node.session(SESSION).is_none());
+        assert!(node.connection(CONNECTION).is_none());
         assert_eq!(
-            node.abandoned.read().unwrap().get(SESSION),
-            Some(&session.generation)
+            node.abandoned.read().unwrap().get(CONNECTION),
+            Some(&connection.generation)
         );
         *node.link.write().unwrap() = Some(Link::fixture());
         node.tick_leases().await;
         assert!(
-            node.session(SESSION).is_none(),
+            node.connection(CONNECTION).is_none(),
             "the refused generation was served again"
         );
         let (next, _) = acquired(&node).await;
-        assert!(next.fence.generation > session.generation);
+        assert!(next.fence.generation > connection.generation);
     }
 
     #[tokio::test]
@@ -864,12 +885,12 @@ secret = "fixture-application-secret"
         let node = node();
         let origin = Link::fixture();
         *node.link.write().unwrap() = Some(origin.clone());
-        let (lease, session) = acquired(&node).await;
+        let (lease, connection) = acquired(&node).await;
         node.shutdown().await;
         assert!(*node.shutdown.borrow());
-        assert!(!node.publish_acquired(SESSION, session, &origin));
-        assert!(node.session(SESSION).is_none());
-        node.abandon(SESSION, &lease).await;
+        assert!(!node.publish_acquired(CONNECTION, connection, &origin));
+        assert!(node.connection(CONNECTION).is_none());
+        node.abandon(CONNECTION, &lease).await;
     }
 
     #[tokio::test]
@@ -877,21 +898,21 @@ secret = "fixture-application-secret"
         let node = node();
         let origin = Link::fixture();
         *node.link.write().unwrap() = Some(origin.clone());
-        let (lease, session) = acquired(&node).await;
+        let (lease, connection) = acquired(&node).await;
 
         // Acquisition/activation awaited storage while disconnect took its
-        // session snapshot. The late result must never become a live session.
+        // connection snapshot. The late result must never become a live connection.
         node.disconnected().await;
-        assert!(!node.publish_acquired(SESSION, session.clone(), &origin));
-        assert!(node.session(SESSION).is_none());
+        assert!(!node.publish_acquired(CONNECTION, connection.clone(), &origin));
+        assert!(node.connection(CONNECTION).is_none());
         let successor = Link::fixture();
         *node.link.write().unwrap() = Some(successor.clone());
-        assert!(!node.publish_acquired(SESSION, session.clone(), &origin));
-        node.abandon(SESSION, &lease).await;
+        assert!(!node.publish_acquired(CONNECTION, connection.clone(), &origin));
+        node.abandon(CONNECTION, &lease).await;
 
         let (_, next) = acquired(&node).await;
-        assert!(node.publish_acquired(SESSION, next, &successor));
+        assert!(node.publish_acquired(CONNECTION, next, &successor));
         node.disconnected().await;
-        assert!(node.session(SESSION).is_none());
+        assert!(node.connection(CONNECTION).is_none());
     }
 }

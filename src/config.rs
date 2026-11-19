@@ -94,11 +94,11 @@ pub struct PolymorfaConfig {
     pub credential: Secret,
     #[serde(default)]
     pub credential_file: Option<PathBuf>,
-    /// Zero-knowledge session IDs this deployment serves. Every node of a
-    /// deployment lists the same sessions; leases decide which node serves
+    /// Zero-knowledge connection IDs this deployment serves. Every node of a
+    /// deployment lists the same connections; leases decide which node serves
     /// each one.
     #[serde(default)]
-    pub sessions: Vec<String>,
+    pub connections: Vec<String>,
     /// Longest wait for a response to a request this node sends.
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -127,7 +127,7 @@ pub struct StorageConfig {
     pub url: Secret,
     #[serde(default)]
     pub url_file: Option<PathBuf>,
-    /// Base64 of 32 random bytes. Wraps each session's data key.
+    /// Base64 of 32 random bytes. Wraps each connection's data key.
     #[serde(default)]
     pub master_key: Secret,
     #[serde(default)]
@@ -143,7 +143,7 @@ pub struct LeaseConfig {
     /// long after a node stops.
     #[serde(default = "default_lease_ttl_ms")]
     pub ttl_ms: u64,
-    /// How often leases are renewed and free sessions are tried.
+    /// How often leases are renewed and free connections are tried.
     #[serde(default = "default_lease_renew_ms")]
     pub renew_interval_ms: u64,
 }
@@ -287,7 +287,7 @@ pub struct Resolved {
     pub node_id: String,
     pub polymorfa_url: String,
     pub credential: Secret,
-    pub sessions: Vec<String>,
+    pub connections: Vec<String>,
     pub request_timeout: Duration,
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
@@ -314,7 +314,7 @@ impl std::fmt::Debug for Resolved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Resolved")
             .field("node_id", &self.node_id)
-            .field("sessions", &self.sessions)
+            .field("connections", &self.connections)
             .field("storage_driver", &self.storage_driver)
             .field("master_key", &"<redacted>")
             .field("credential", &self.credential)
@@ -329,7 +329,7 @@ pub const ENV_VARS: &[&str] = &[
     "SIGNAL_NODE_ID",
     "SIGNAL_NODE_POLYMORFA_URL",
     "SIGNAL_NODE_POLYMORFA_CREDENTIAL",
-    "SIGNAL_NODE_SESSIONS",
+    "SIGNAL_NODE_CONNECTIONS",
     "SIGNAL_NODE_STORAGE_DRIVER",
     "SIGNAL_NODE_STORAGE_URL",
     "SIGNAL_NODE_MASTER_KEY",
@@ -365,8 +365,8 @@ impl Config {
         if let Some(v) = env("SIGNAL_NODE_POLYMORFA_CREDENTIAL") {
             self.polymorfa.credential = Secret::new(v);
         }
-        if let Some(v) = env("SIGNAL_NODE_SESSIONS") {
-            self.polymorfa.sessions = v
+        if let Some(v) = env("SIGNAL_NODE_CONNECTIONS") {
+            self.polymorfa.connections = v
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -522,9 +522,9 @@ impl Config {
                 "leases.renew_interval_ms must be at most half of leases.ttl_ms",
             ));
         }
-        for id in &self.polymorfa.sessions {
+        for id in &self.polymorfa.connections {
             if id.is_empty() || id.len() > 200 {
-                return Err(invalid("session IDs must be 1 to 200 characters"));
+                return Err(invalid("connection IDs must be 1 to 200 characters"));
             }
         }
         let node_id = if self.node_id.is_empty() {
@@ -552,7 +552,7 @@ impl Config {
             node_id,
             polymorfa_url: self.polymorfa.url,
             credential,
-            sessions: self.polymorfa.sessions,
+            connections: self.polymorfa.connections,
             request_timeout: Duration::from_millis(self.polymorfa.request_timeout_ms),
             reconnect_min: Duration::from_millis(self.polymorfa.reconnect_min_ms),
             reconnect_max: Duration::from_millis(self.polymorfa.reconnect_max_ms),
@@ -620,7 +620,7 @@ mod tests {
         [polymorfa]
         url = "wss://example.invalid/signal"
         credential = "pk_test_credential"
-        sessions = ["sess_a", "sess_b"]
+        connections = ["sess_a", "sess_b"]
 
         [storage]
         driver = "memory"
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn a_minimal_file_resolves_with_defaults() {
         let resolved = Config::from_toml(MINIMAL).unwrap().resolve().unwrap();
-        assert_eq!(resolved.sessions, ["sess_a", "sess_b"]);
+        assert_eq!(resolved.connections, ["sess_a", "sess_b"]);
         assert_eq!(resolved.lease_ttl_ms, 30_000);
         assert!(!resolved.deliver_history, "history must be off by default");
         assert!(
@@ -661,14 +661,14 @@ mod tests {
         let mut config = Config::from_toml(MINIMAL).unwrap();
         config
             .apply_env(|name| match name {
-                "SIGNAL_NODE_SESSIONS" => Some("one, two".into()),
+                "SIGNAL_NODE_CONNECTIONS" => Some("one, two".into()),
                 "SIGNAL_NODE_HISTORY_DELIVER" => Some("true".into()),
                 "SIGNAL_NODE_ID" => Some("node-9".into()),
                 _ => None,
             })
             .unwrap();
         let resolved = config.resolve().unwrap();
-        assert_eq!(resolved.sessions, ["one", "two"]);
+        assert_eq!(resolved.connections, ["one", "two"]);
         assert!(resolved.deliver_history);
         assert_eq!(resolved.node_id, "node-9");
     }

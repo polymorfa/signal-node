@@ -31,12 +31,12 @@ async fn encrypted(
     body: wa::Message,
     from_me: bool,
 ) -> proto::Receive {
-    let session = running.node.session(SESSION).unwrap();
-    let identity = identity(hub, node, session.generation).await;
+    let connection = running.node.connection(CONNECTION).unwrap();
+    let identity = identity(hub, node, connection.generation).await;
     let response = hub
         .command(
             node,
-            session.generation,
+            connection.generation,
             Op::GeneratePreKeys(proto::GeneratePreKeys { count: 1 }),
         )
         .await;
@@ -49,7 +49,7 @@ async fn encrypted(
     // The node is a paired companion of its own account. The sender is either
     // a companion of another account the node has pinned, or, for an own
     // device message, another device paired under the node's own account.
-    let node_ops = session.ops().unwrap();
+    let node_ops = connection.ops().unwrap();
     let node = pair(&*node_ops).await;
     // The hub's claim reply names this account's phone number; the service
     // cannot apply it before the device keys exist.
@@ -155,7 +155,7 @@ async fn app_auth_origin_and_public_liveness_keep_private_state_hidden() {
     assert_eq!(health, serde_json::json!({"status":"ok"}));
     assert_eq!(
         client
-            .get(format!("{url}/v1/sessions"))
+            .get(format!("{url}/v1/connections"))
             .send()
             .await
             .unwrap()
@@ -164,7 +164,7 @@ async fn app_auth_origin_and_public_liveness_keep_private_state_hidden() {
     );
     assert_eq!(
         client
-            .get(format!("{url}/v1/sessions"))
+            .get(format!("{url}/v1/connections"))
             .bearer_auth(APP_SECRET)
             .header("Origin", "null")
             .send()
@@ -173,8 +173,8 @@ async fn app_auth_origin_and_public_liveness_keep_private_state_hidden() {
             .status(),
         403
     );
-    let sessions = client
-        .get(format!("{url}/v1/sessions"))
+    let connections = client
+        .get(format!("{url}/v1/connections"))
         .bearer_auth(APP_SECRET)
         .send()
         .await
@@ -182,13 +182,36 @@ async fn app_auth_origin_and_public_liveness_keep_private_state_hidden() {
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(sessions["sessions"][0]["claimed"], true);
-    assert!(!sessions.to_string().contains("master_key"));
+    assert_eq!(connections["connections"][0]["claimed"], true);
+    assert_eq!(connections["connections"][0]["id"], CONNECTION);
+    assert!(connections.get("sessions").is_none());
+    assert!(!connections.to_string().contains("master_key"));
+    assert_eq!(
+        client
+            .get(format!("{url}/v1/sessions"))
+            .bearer_auth(APP_SECRET)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // A retired filter must fail instead of silently subscribing to every Connection.
+    assert_eq!(
+        client
+            .get(format!("{url}/v1/events?session_id=other"))
+            .bearer_auth(APP_SECRET)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
     running.shutdown().await;
 }
 
 #[tokio::test]
-async fn an_unrelated_sse_filter_does_not_make_a_session_wait_for_an_ack() {
+async fn an_unrelated_sse_filter_does_not_make_a_connection_wait_for_an_ack() {
     let hub = Hub::start().await;
     let running = start(
         &hub,
@@ -197,7 +220,7 @@ async fn an_unrelated_sse_filter_does_not_make_a_session_wait_for_an_ack() {
         false,
     )
     .await;
-    let generation = running.node.session(SESSION).unwrap().generation;
+    let generation = running.node.connection(CONNECTION).unwrap().generation;
     let receive = encrypted(
         &hub,
         "node-filter",
@@ -210,7 +233,7 @@ async fn an_unrelated_sse_filter_does_not_make_a_session_wait_for_an_ack() {
     .await;
     let response = reqwest::Client::new()
         .get(format!(
-            "http://{}/v1/events?session_id=other",
+            "http://{}/v1/events?connection_id=other",
             running.http_addr
         ))
         .bearer_auth(APP_SECRET)
@@ -239,7 +262,7 @@ async fn real_encrypted_receive_requires_app_ack_then_is_durable_and_sealed() {
         false,
     )
     .await;
-    let generation = running.node.session(SESSION).unwrap().generation;
+    let generation = running.node.connection(CONNECTION).unwrap().generation;
     let receive = encrypted(
         &hub,
         "node-receive",
@@ -303,8 +326,8 @@ async fn real_encrypted_receive_requires_app_ack_then_is_durable_and_sealed() {
         }))
     ));
     for ns in Namespace::ALL {
-        for key in records.scan_keys(SESSION, ns, "", None).await.unwrap() {
-            let value = records.get(SESSION, ns, &key).await.unwrap().unwrap();
+        for key in records.scan_keys(CONNECTION, ns, "", None).await.unwrap() {
+            let value = records.get(CONNECTION, ns, &key).await.unwrap().unwrap();
             assert!(
                 !value
                     .windows(b"application-private-text".len())
@@ -339,7 +362,7 @@ async fn unacknowledged_receive_replays_across_crash_and_old_holder_is_fenced() 
         false,
     )
     .await;
-    let old = first.node.session(SESSION).unwrap();
+    let old = first.node.connection(CONNECTION).unwrap();
     let generation = old.generation;
     let receive = encrypted(
         &hub,
@@ -361,7 +384,7 @@ async fn unacknowledged_receive_replays_across_crash_and_old_holder_is_fenced() 
     first.abort();
     tokio::time::sleep(std::time::Duration::from_millis(650)).await;
     let second = start(&hub, "node-crash-b", Backend::Memory(records), false).await;
-    let generation2 = second.node.session(SESSION).unwrap().generation;
+    let generation2 = second.node.connection(CONNECTION).unwrap().generation;
     assert!(generation2 > generation);
     let old_write = stale
         .generate_prekeys(&signal_node::resolver::TokioRuntime, 1)
@@ -435,11 +458,11 @@ async fn app_state_keys_require_separate_consent_and_an_own_device() {
         wait(|| {
             running
                 .node
-                .session(SESSION)
+                .connection(CONNECTION)
                 .is_some_and(|s| s.is_claimed())
         })
         .await;
-        let generation = running.node.session(SESSION).unwrap().generation;
+        let generation = running.node.connection(CONNECTION).unwrap().generation;
         let expected = app_state_share();
         let receive = encrypted(
             &hub,
@@ -512,11 +535,11 @@ async fn app_state_share_survives_a_lost_reply_and_restart_with_live_consent_che
     wait(|| {
         running
             .node
-            .session(SESSION)
+            .connection(CONNECTION)
             .is_some_and(|s| s.is_claimed())
     })
     .await;
-    let generation = running.node.session(SESSION).unwrap().generation;
+    let generation = running.node.connection(CONNECTION).unwrap().generation;
     let share = app_state_share();
     let receive = encrypted(
         &hub,
@@ -556,11 +579,11 @@ async fn app_state_share_survives_a_lost_reply_and_restart_with_live_consent_che
         wait(|| {
             replacement
                 .node
-                .session(SESSION)
+                .connection(CONNECTION)
                 .is_some_and(|s| s.is_claimed())
         })
         .await;
-        let generation = replacement.node.session(SESSION).unwrap().generation;
+        let generation = replacement.node.connection(CONNECTION).unwrap().generation;
         for from_me in [true, false] {
             let mut retry = receive.clone();
             retry.is_from_me = from_me;
@@ -598,7 +621,7 @@ async fn history_stays_off_until_explicit_consent_and_delivers_only_the_notifica
             consent,
         )
         .await;
-        let generation = running.node.session(SESSION).unwrap().generation;
+        let generation = running.node.connection(CONNECTION).unwrap().generation;
         let message = proto!(wa::Message {
             protocol_message: proto!(wa::message::ProtocolMessage {
                 r#type: Some(wa::message::protocol_message::Type::HistorySyncNotification),
@@ -674,9 +697,9 @@ async fn http_send_stanza_round_trips_into_the_other_device_and_never_exceeds_fi
         false,
     )
     .await;
-    let generation = running.node.session(SESSION).unwrap().generation;
+    let generation = running.node.connection(CONNECTION).unwrap().generation;
     identity(&hub, "node-send", generation).await;
-    let ops = running.node.session(SESSION).unwrap().ops().unwrap();
+    let ops = running.node.connection(CONNECTION).unwrap().ops().unwrap();
     let node = pair(&*ops).await;
     ops.set_own_jids("222:1@s.whatsapp.net", None)
         .await
@@ -687,7 +710,7 @@ async fn http_send_stanza_round_trips_into_the_other_device_and_never_exceeds_fi
     hub.bundle("111:1@s.whatsapp.net", bundle).await;
     let client = reqwest::Client::new();
     let url = format!(
-        "http://{}/v1/sessions/{SESSION}/messages",
+        "http://{}/v1/connections/{CONNECTION}/messages",
         running.http_addr
     );
     for _ in 0..7 {
@@ -770,9 +793,9 @@ async fn a_lost_send_reply_reports_the_original_unconfirmed_message_without_retr
             false,
         )
         .await;
-        let generation = running.node.session(SESSION).unwrap().generation;
+        let generation = running.node.connection(CONNECTION).unwrap().generation;
         identity(&hub, "node-uncertain", generation).await;
-        let ops = running.node.session(SESSION).unwrap().ops().unwrap();
+        let ops = running.node.connection(CONNECTION).unwrap().ops().unwrap();
         pair(&*ops).await;
         ops.set_own_jids("222:1@s.whatsapp.net", Some("22201:1@lid"))
             .await
@@ -783,7 +806,7 @@ async fn a_lost_send_reply_reports_the_original_unconfirmed_message_without_retr
         hub.lose_send_reply(disconnect);
         let response = reqwest::Client::new()
             .post(format!(
-                "http://{}/v1/sessions/{SESSION}/messages",
+                "http://{}/v1/connections/{CONNECTION}/messages",
                 running.http_addr
             ))
             .bearer_auth(APP_SECRET)
@@ -822,9 +845,9 @@ async fn a_failed_mismatch_resend_keeps_the_original_message_unconfirmed() {
             false,
         )
         .await;
-        let session = running.node.session(SESSION).unwrap();
-        identity(&hub, "node-resend", session.generation).await;
-        let ops = session.ops().unwrap();
+        let connection = running.node.connection(CONNECTION).unwrap();
+        identity(&hub, "node-resend", connection.generation).await;
+        let ops = connection.ops().unwrap();
         pair(&*ops).await;
         ops.set_own_jids("222:1@s.whatsapp.net", Some("22201:1@lid"))
             .await
@@ -835,7 +858,7 @@ async fn a_failed_mismatch_resend_keeps_the_original_message_unconfirmed() {
         hub.fail_resend(failure);
         let response = reqwest::Client::new()
             .post(format!(
-                "http://{}/v1/sessions/{SESSION}/messages",
+                "http://{}/v1/connections/{CONNECTION}/messages",
                 running.http_addr
             ))
             .bearer_auth(APP_SECRET)
@@ -881,9 +904,9 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
         let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
         let hub = Hub::start().await;
         let running = start(&hub, "node-mark-failure", Backend::Sqlite(backend), false).await;
-        let session = running.node.session(SESSION).unwrap();
-        identity(&hub, "node-mark-failure", session.generation).await;
-        let ops = session.ops().unwrap();
+        let connection = running.node.connection(CONNECTION).unwrap();
+        identity(&hub, "node-mark-failure", connection.generation).await;
+        let ops = connection.ops().unwrap();
         pair(&*ops).await;
         ops.set_own_jids("222:1@s.whatsapp.net", Some("22201:1@lid"))
             .await
@@ -901,7 +924,7 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
         let (observed, release) = hub.gate_next_send().await;
         let send = reqwest::Client::new()
             .post(format!(
-                "http://{}/v1/sessions/{SESSION}/messages",
+                "http://{}/v1/connections/{CONNECTION}/messages",
                 running.http_addr
             ))
             .bearer_auth(APP_SECRET)
@@ -913,7 +936,7 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
                 .expect("send never reached the runner");
             if fence_lost {
                 sqlx::query("UPDATE signal_leases SET generation = generation + 1 WHERE scope = ?")
-                    .bind(SESSION)
+                    .bind(CONNECTION)
                     .execute(&pool)
                     .await
                     .unwrap();
@@ -946,12 +969,12 @@ async fn an_accepted_group_send_survives_distribution_storage_failure_or_fence_l
         }
         if fence_lost {
             assert!(
-                !session.can_serve().await,
-                "fence loss must still retire the old session"
+                !connection.can_serve().await,
+                "fence loss must still retire the old connection"
             );
         }
         drop(ops);
-        drop(session);
+        drop(connection);
         running.shutdown().await;
         pool.close().await;
         std::fs::remove_file(&path).unwrap();
@@ -1038,11 +1061,11 @@ async fn webhook_signature_failure_and_ack_gate_durable_delivery() {
     wait(|| {
         running
             .node
-            .session(SESSION)
+            .connection(CONNECTION)
             .is_some_and(|s| s.is_claimed())
     })
     .await;
-    let generation = running.node.session(SESSION).unwrap().generation;
+    let generation = running.node.connection(CONNECTION).unwrap().generation;
     let ciphertext = encrypted(
         &hub,
         "node-webhook",
@@ -1116,15 +1139,15 @@ async fn expired_holder_refuses_requests_and_old_callbacks_preserve_new_generati
         false,
     )
     .await;
-    let old_session = old.node.session(SESSION).unwrap();
+    let old_connection = old.node.connection(CONNECTION).unwrap();
     old.abort();
     tokio::time::sleep(std::time::Duration::from_millis(650)).await;
-    assert!(!old_session.can_serve().await);
+    assert!(!old_connection.can_serve().await);
     let error = old
         .node
         .runner_request(proto::RunnerRequest {
-            session_id: SESSION.into(),
-            lease_generation: old_session.generation,
+            connection_id: CONNECTION.into(),
+            lease_generation: old_connection.generation,
             op: Some(Op::GetIdentity(proto::GetIdentity {})),
         })
         .await
@@ -1132,13 +1155,13 @@ async fn expired_holder_refuses_requests_and_old_callbacks_preserve_new_generati
     assert_eq!(error.code_enum(), proto::Code::NotLeaseHolder);
     old.node.tick_leases().await; // Releases the expired generation.
     old.node.tick_leases().await; // Same holder ID must take a new generation.
-    let new_session = old.node.session(SESSION).unwrap();
-    assert!(new_session.generation > old_session.generation);
+    let new_connection = old.node.connection(CONNECTION).unwrap();
+    assert!(new_connection.generation > old_connection.generation);
     old.node
-        .lose(SESSION, old_session.generation, "late old callback");
+        .lose(CONNECTION, old_connection.generation, "late old callback");
     assert_eq!(
-        old.node.session(SESSION).unwrap().generation,
-        new_session.generation
+        old.node.connection(CONNECTION).unwrap().generation,
+        new_connection.generation
     );
     old.node.shutdown().await;
 }
@@ -1155,7 +1178,7 @@ async fn process_incarnations_with_the_same_node_id_cannot_share_a_fence() {
         false,
     )
     .await;
-    let old = first.node.session(SESSION).unwrap();
+    let old = first.node.connection(CONNECTION).unwrap();
     let ops = old.ops_or_create().await.unwrap();
     let replacement = signal_node::start(
         config("same-stable-node", &hub.url, false),
@@ -1165,14 +1188,14 @@ async fn process_incarnations_with_the_same_node_id_cannot_share_a_fence() {
     .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert!(
-        replacement.node.session(SESSION).is_none(),
+        replacement.node.connection(CONNECTION).is_none(),
         "an active lease cannot be reacquired by another process with the same node ID"
     );
     first.abort();
     wait(|| {
         replacement
             .node
-            .session(SESSION)
+            .connection(CONNECTION)
             .is_some_and(|s| s.generation > old.generation)
     })
     .await;
@@ -1196,7 +1219,7 @@ async fn group_retry_rejects_unknown_or_missing_addressing_mode() {
         false,
     )
     .await;
-    let generation = running.node.session(SESSION).unwrap().generation;
+    let generation = running.node.connection(CONNECTION).unwrap().generation;
     identity(&hub, "node-group-validation", generation).await;
     for mode in ["", "unknown"] {
         let response = hub
@@ -1280,7 +1303,7 @@ async fn mixed_protocol_text_is_delivered_without_foreign_keys_or_unconsented_hi
             false,
         )
         .await;
-        let generation = running.node.session(SESSION).unwrap().generation;
+        let generation = running.node.connection(CONNECTION).unwrap().generation;
         let ciphertext = encrypted(
             &hub,
             "node-mixed",
@@ -1360,27 +1383,27 @@ async fn reconnect_claims_a_strictly_higher_durable_generation() {
         false,
     )
     .await;
-    let first = running.node.session(SESSION).unwrap().generation;
+    let first = running.node.connection(CONNECTION).unwrap().generation;
     hub.disconnect("node-reconnect").await;
     wait(|| {
         running
             .node
-            .session(SESSION)
+            .connection(CONNECTION)
             .is_some_and(|s| s.generation > first && s.is_claimed())
     })
     .await;
-    assert!(running.node.session(SESSION).unwrap().generation > first);
+    assert!(running.node.connection(CONNECTION).unwrap().generation > first);
     running.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_node_without_a_live_link_takes_no_leases() {
-    // A partitioned replica must leave free sessions to a connected one.
+    // A partitioned replica must leave free connections to a connected one.
     let node = signal_node::node::Node::new(
         config("partitioned", "ws://127.0.0.1:1/signal", false),
         Backend::Memory(Arc::new(MemoryRecordStore::new())),
     );
     node.tick_leases().await;
-    assert!(node.session(SESSION).is_none());
+    assert!(node.connection(CONNECTION).is_none());
     node.shutdown().await;
 }

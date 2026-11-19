@@ -5,7 +5,7 @@
 //! The node builds the encrypted stanza itself (device lists, prekeys and
 //! group routing come from Polymorfa through [`RemoteResolver`]), then asks
 //! Polymorfa to transmit it with `SendStanza`. Every `SendStanza`, including
-//! a resend, first waits for the per-session ceiling.
+//! a resend, first waits for the per-connection ceiling.
 //!
 //! When the server reports a participant-hash mismatch, the device list
 //! changed while the message was in flight. WhatsApp Web then refreshes the
@@ -18,7 +18,7 @@
 
 use crate::link::LinkError;
 use crate::message::{self, BuildError, SendRequest};
-use crate::node::{ActiveSession, Node};
+use crate::node::{ActiveConnection, Node};
 use crate::proto::{self, Code, SendStanza, runner_response, service_request};
 use crate::resolver::{RemoteResolver, TokioRuntime};
 use serde::Serialize;
@@ -38,9 +38,9 @@ pub struct SendOutcome {
 pub enum SendError {
     #[error("{0}")]
     Invalid(String),
-    #[error("this node does not hold the session")]
+    #[error("this node does not hold the connection")]
     NotLeaseHolder,
-    #[error("the session is not paired yet")]
+    #[error("the connection is not paired yet")]
     NotPaired,
     #[error("not connected to Polymorfa")]
     Disconnected,
@@ -50,7 +50,7 @@ pub enum SendError {
     Refused(proto::Error),
     #[error("send ceiling reached")]
     RateLimited,
-    #[error("session storage is unavailable")]
+    #[error("connection storage is unavailable")]
     StorageUnavailable,
     #[error("building the stanza failed")]
     Build,
@@ -75,9 +75,9 @@ enum Built {
     },
 }
 
-fn ops_failure(node: &Node, session: &ActiveSession, error: &OpsError) -> SendError {
+fn ops_failure(node: &Node, connection: &ActiveConnection, error: &OpsError) -> SendError {
     if error.is_fence_lost() {
-        node.ops_error(session, error);
+        node.ops_error(connection, error);
         return SendError::NotLeaseHolder;
     }
     match error {
@@ -93,7 +93,7 @@ fn ops_failure(node: &Node, session: &ActiveSession, error: &OpsError) -> SendEr
 
 pub async fn send(
     node: &Node,
-    session: &Arc<ActiveSession>,
+    connection: &Arc<ActiveConnection>,
     request: SendRequest,
 ) -> Result<SendOutcome, SendError> {
     let to: Jid = request
@@ -102,8 +102,8 @@ pub async fn send(
         .map_err(|_| SendError::Invalid("to is not a valid JID".into()))?;
     let now = crate::delivery::now_secs();
     let message = message::build_message(&request, now)?;
-    let ops = session.ops().ok_or(SendError::NotPaired)?;
-    let own = session.view().pn.and_then(|pn| pn.parse::<Jid>().ok());
+    let ops = connection.ops().ok_or(SendError::NotPaired)?;
+    let own = connection.view().pn.and_then(|pn| pn.parse::<Jid>().ok());
     let message_id =
         wacore::request::RequestUtils::message_id_at(own.as_ref(), u64::try_from(now).unwrap_or(0));
 
@@ -111,19 +111,19 @@ pub async fn send(
     let outcome = async {
         loop {
             let link = node.link().ok_or(SendError::Disconnected)?;
-            if !session.can_serve().await || !session.is_claimed() {
+            if !connection.can_serve().await || !connection.is_claimed() {
                 return Err(SendError::NotLeaseHolder);
             }
             let resolver = RemoteResolver {
                 link: link.clone(),
-                session_id: session.id.clone(),
-                generation: session.generation,
+                connection_id: connection.id.clone(),
+                generation: connection.generation,
             };
             let built = if to.is_group() {
                 let prepared = ops
                     .send_group(&TokioRuntime, &resolver, &to, &message, &message_id)
                     .await
-                    .map_err(|e| ops_failure(node, session, &e))?;
+                    .map_err(|e| ops_failure(node, connection, &e))?;
                 Built::Group {
                     stanza: prepared.stanza,
                     phash: prepared.phash,
@@ -134,7 +134,7 @@ pub async fn send(
                 let prepared = ops
                     .send_direct(&TokioRuntime, &resolver, &to, &message, &message_id)
                     .await
-                    .map_err(|e| ops_failure(node, session, &e))?;
+                    .map_err(|e| ops_failure(node, connection, &e))?;
                 Built::Direct {
                     stanza: prepared.stanza,
                     phash: prepared.phash,
@@ -146,15 +146,15 @@ pub async fn send(
                 }
             };
 
-            session.limiter.acquire(link.max_sends_per_second()).await;
-            if !session.can_serve().await || !session.is_claimed() {
+            connection.limiter.acquire(link.max_sends_per_second()).await;
+            if !connection.can_serve().await || !connection.is_claimed() {
                 return Err(SendError::NotLeaseHolder);
             }
             let op = service_request::Op::SendStanza(SendStanza {
                 node: stanza,
                 phash,
             });
-            let result = match link.request(&session.id, session.generation, op).await {
+            let result = match link.request(&connection.id, connection.generation, op).await {
                 Ok(runner_response::Result::Send(result)) => result,
                 Ok(_) => {
                     return Err(SendError::Unconfirmed {
@@ -166,7 +166,7 @@ pub async fn send(
                         Code::RateLimited => SendError::RateLimited,
                         Code::NotLeaseHolder => {
                             node.refused_generation(
-                                session,
+                                connection,
                                 "Polymorfa refused a send at this generation",
                             )
                             .await;
@@ -193,13 +193,13 @@ pub async fn send(
                     Ok(true) => {}
                     // The group's sender key rotated after this send was built,
                     // so its targets hold the old key; the next send redistributes.
-                    Ok(false) => tracing::debug!(session = %session.id, message_id = %message_id, "sender key rotated before the send was acknowledged"),
+                    Ok(false) => tracing::debug!(connection = %connection.id, message_id = %message_id, "sender key rotated before the send was acknowledged"),
                     Err(e) => {
                 // The runner has already confirmed the send. A failed local
                 // distribution mark must not invite a new message ID. Only fence
-                // loss stops the same-ID mismatch resend and retires this session.
-                node.ops_error(session, &e);
-                tracing::warn!(session = %session.id, message_id = %message_id, "send accepted; sender-key distribution was not recorded");
+                // loss stops the same-ID mismatch resend and retires this connection.
+                node.ops_error(connection, &e);
+                tracing::warn!(connection = %connection.id, message_id = %message_id, "send accepted; sender-key distribution was not recorded");
                 if e.is_fence_lost() {
                     return Ok(SendOutcome {
                         message_id: message_id.clone(),
@@ -210,9 +210,9 @@ pub async fn send(
                     }
                 }
             }
-            tracing::info!(session = %session.id, message_id = %message_id, resent, "sent");
+            tracing::info!(connection = %connection.id, message_id = %message_id, resent, "sent");
             if result.participant_hash_mismatch && !resent {
-                tracing::info!(session = %session.id, message_id = %message_id, "device list changed; resending once");
+                tracing::info!(connection = %connection.id, message_id = %message_id, "device list changed; resending once");
                 resent = true;
                 continue;
             }
