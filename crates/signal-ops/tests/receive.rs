@@ -7,6 +7,9 @@ use futures::executor::block_on;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{DeviceId, KeyPair, ProtocolAddress};
 use wacore::messages::MessageUtils;
+use wacore::store::traits::SignalStore;
+use wacore::types::jid::JidExt;
+use wacore_binary::Jid;
 use wacore_recordstore::{
     AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
     WriteOp,
@@ -29,6 +32,7 @@ struct Device {
     records: Arc<MemoryRecordStore>,
     scope: &'static str,
     ops: SignalOps<Store>,
+    store: Arc<Store>,
 }
 
 fn store_for(records: &Arc<MemoryRecordStore>, scope: &str, holder: &str, now: u64) -> Arc<Store> {
@@ -44,11 +48,13 @@ fn store_for(records: &Arc<MemoryRecordStore>, scope: &str, holder: &str, now: u
 
 fn device(scope: &'static str) -> Device {
     let records = Arc::new(MemoryRecordStore::new());
-    let ops = block_on(SignalOps::create(store_for(&records, scope, "node-a", 0))).unwrap();
+    let store = store_for(&records, scope, "node-a", 0);
+    let ops = block_on(SignalOps::create(store.clone())).unwrap();
     Device {
         records,
         scope,
         ops,
+        store,
     }
 }
 
@@ -267,6 +273,30 @@ fn a_sender_key_carried_in_a_pairwise_message_unlocks_group_traffic() {
         group.content.message.conversation.as_deref(),
         Some("hi group")
     );
+
+    for status_session in [false, true] {
+        let ciphertext = block_on(alice.ops.group_encrypt(
+            GROUP,
+            &alice_addr,
+            &padded(&text("group publication")),
+        ))
+        .unwrap();
+        let request = request(
+            GROUP,
+            &alice_addr,
+            ReceiveKind::SenderKey,
+            &ciphertext,
+            false,
+        );
+        let first = message(block_on(bob.ops.receive_status(request, status_session)).unwrap());
+        assert_eq!(
+            first.content.message.conversation.as_deref(),
+            Some("group publication")
+        );
+        let replay = message(block_on(bob.ops.receive_status(request, !status_session)).unwrap());
+        assert!(replay.redelivered);
+        assert_eq!(replay.receipt_key, first.receipt_key);
+    }
 }
 
 #[test]
@@ -704,5 +734,349 @@ fn a_message_that_replaces_the_stored_identity_reports_it() {
     assert!(
         received.identity_changed,
         "a msg that replaces the stored identity must say so"
+    );
+}
+
+thread_local! {
+    static STATUS_ACCOUNTS: std::cell::RefCell<std::collections::HashMap<String, KeyPair>> = std::cell::RefCell::default();
+}
+fn status_vouch(
+    receiver: &SignalOps<Store>,
+    peer: &SignalOps<Store>,
+    address: &ProtocolAddress,
+) -> Vec<u8> {
+    let account = STATUS_ACCOUNTS.with(|accounts| accounts.borrow().get(address.name()).cloned());
+    let (account, identity) = if let Some(account) = account {
+        let identity = block_on(common::pair_under(peer, &account));
+        (account, identity)
+    } else {
+        let paired = block_on(common::pair(peer));
+        STATUS_ACCOUNTS.with(|accounts| {
+            accounts
+                .borrow_mut()
+                .insert(address.name().to_owned(), paired.account_keys.clone());
+        });
+        (paired.account_keys, paired.device_identity)
+    };
+    let jid: Jid = address.name().parse().unwrap();
+    block_on(receiver.trust_account_identity(&jid, *account.public_key.public_key_bytes()))
+        .unwrap();
+    identity
+}
+fn status_connect(
+    from: &Device,
+    to: &Device,
+    from_addr: &ProtocolAddress,
+    to_addr: &ProtocolAddress,
+) {
+    let from_identity = status_vouch(&to.ops, &from.ops, from_addr);
+    SENDER_IDENTITIES.with(|map| {
+        map.borrow_mut().insert(
+            from_addr.name().to_owned(),
+            Box::leak(from_identity.into_boxed_slice()),
+        );
+    });
+    let to_identity = status_vouch(&from.ops, &to.ops, to_addr);
+    let identity = block_on(to.ops.public_identity());
+    let prekey = block_on(to.ops.generate_prekeys(&InlineRuntime, 1))
+        .unwrap()
+        .remove(0);
+    block_on(from.ops.establish_session(
+        to_addr,
+        &RemoteBundle {
+            registration_id: identity.registration_id,
+            device_id: 1,
+            identity_key: identity.identity_key,
+            signed_prekey_id: identity.signed_prekey.id,
+            signed_prekey: identity.signed_prekey.public_key,
+            signed_prekey_signature: identity.signed_prekey.signature,
+            prekey: Some((prekey.id, prekey.public_key)),
+            device_identity: Some(to_identity),
+        },
+    ))
+    .unwrap();
+}
+fn status_identity(address: &ProtocolAddress) -> Option<&'static [u8]> {
+    SENDER_IDENTITIES.with(|map| map.borrow().get(address.name()).copied())
+}
+
+#[test]
+fn status_ratchets_alternate_without_changing_chat_state_and_follow_identity_migration() {
+    let alice = device("alice-status");
+    let bob = device("bob-status");
+    let alice_addr = "111:1@s.whatsapp.net"
+        .parse::<Jid>()
+        .unwrap()
+        .to_protocol_address();
+    let bob_addr = "222:1@s.whatsapp.net"
+        .parse::<Jid>()
+        .unwrap()
+        .to_protocol_address();
+    let mut sender_sessions = Vec::new();
+    for status in [false, true] {
+        status_connect(&alice, &bob, &alice_addr, &bob_addr);
+        let body = if status { "status first" } else { "chat first" };
+        let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text(body)))).unwrap();
+        let req = request(
+            if status {
+                "status@broadcast"
+            } else {
+                "111@s.whatsapp.net"
+            },
+            &alice_addr,
+            kind(&sent),
+            &sent.ciphertext,
+            false,
+        );
+        let received = message(block_on(bob.ops.receive_status(req, status)).unwrap());
+        assert_eq!(received.content.message.conversation.as_deref(), Some(body));
+        let repeated = message(block_on(bob.ops.receive_status(req, status)).unwrap());
+        assert!(repeated.redelivered);
+        block_on(bob.ops.mark_delivered(&received.receipt_key)).unwrap();
+        assert!(matches!(
+            block_on(bob.ops.receive_status(req, status)).unwrap(),
+            Received::AlreadyDelivered { .. }
+        ));
+        sender_sessions.push(
+            block_on(alice.store.get_session(bob_addr.as_str()))
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    for i in 0..4 {
+        let status = i % 2 == 1;
+        block_on(
+            alice
+                .store
+                .put_session(bob_addr.as_str(), &sender_sessions[i % 2]),
+        )
+        .unwrap();
+        let body = format!("authored alternating {i}");
+        let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text(&body)))).unwrap();
+        sender_sessions[i % 2] = block_on(alice.store.get_session(bob_addr.as_str()))
+            .unwrap()
+            .unwrap();
+        let req = request(
+            if status {
+                "status@broadcast"
+            } else {
+                "111@s.whatsapp.net"
+            },
+            &alice_addr,
+            kind(&sent),
+            &sent.ciphertext,
+            false,
+        );
+        let received = message(block_on(bob.ops.receive_status(req, status)).unwrap());
+        assert_eq!(
+            received.content.message.conversation.as_deref(),
+            Some(body.as_str())
+        );
+        assert!(!received.identity_changed);
+    }
+    let pn: Jid = "111@s.whatsapp.net".parse().unwrap();
+    let lid: Jid = "333@lid".parse().unwrap();
+    assert_eq!(block_on(bob.ops.migrate_pn_to_lid(&pn, &lid)).unwrap(), 1);
+    let migrated: Jid = "333:1@lid".parse().unwrap();
+    let address = migrated.to_protocol_address();
+    let keys = block_on(
+        bob.records
+            .scan_keys(bob.scope, Namespace::Session, "", None),
+    )
+    .unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&address.as_str().to_owned()));
+    assert!(keys.contains(&format!("{}_status", address.as_str())));
+    block_on(bob.ops.forget_user(&lid)).unwrap();
+    assert!(
+        block_on(
+            bob.records
+                .scan_keys(bob.scope, Namespace::Session, "", None)
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        block_on(
+            bob.records
+                .scan_keys(bob.scope, Namespace::Identity, "", None)
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn delivered_group_publications_keep_only_classification_for_legacy_receipts() {
+    let alice = device("alice-legacy-group-status");
+    let bob = device("bob-legacy-group-status");
+    let (alice_addr, bob_addr) = (address("111"), address("222"));
+    status_connect(&alice, &bob, &alice_addr, &bob_addr);
+    let mut publication = wa::Message::default();
+    let mut wrapper = wa::message::FutureProofMessage::default();
+    wrapper.message = text("authored publication").into();
+    publication.group_status_message_v2 = wrapper.into();
+    let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&publication))).unwrap();
+    let request = request(GROUP, &alice_addr, kind(&sent), &sent.ciphertext, false);
+    let first = message(block_on(bob.ops.receive(request)).unwrap());
+    assert!(first.content.message.group_status_message_v2.is_set());
+    block_on(bob.ops.mark_delivered(&first.receipt_key)).unwrap();
+    assert!(matches!(
+        block_on(bob.ops.receive(request)).unwrap(),
+        Received::AlreadyDelivered {
+            group_status_wrapper: Some(true),
+            ..
+        }
+    ));
+    let mut legacy_marker = block_on(
+        bob.store
+            .load_aux(Namespace::DecryptBuffer, &first.receipt_key),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(legacy_marker.pop(), Some(1));
+    block_on(
+        bob.store
+            .put_aux(Namespace::DecryptBuffer, &first.receipt_key, &legacy_marker),
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(bob.ops.receive(request)).unwrap(),
+        Received::AlreadyDelivered {
+            group_status_wrapper: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn outbound_identity_replacement_invalidates_the_old_status_session() {
+    let old_peer = device("old-peer");
+    let new_peer = device("new-peer");
+    let receiver = device("identity-receiver");
+    let peer_addr = address("111");
+    let receiver_addr = address("222");
+    status_connect(&old_peer, &receiver, &peer_addr, &receiver_addr);
+    let sent = block_on(
+        old_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored old status"))),
+    )
+    .unwrap();
+    let req = request(
+        "status@broadcast",
+        &peer_addr,
+        kind(&sent),
+        &sent.ciphertext,
+        false,
+    );
+    message(block_on(receiver.ops.receive_status(req, true)).unwrap());
+    let status_key = format!("{}_status", peer_addr.as_str());
+    let old_status = block_on(receiver.store.get_session(&status_key))
+        .unwrap()
+        .unwrap();
+    status_connect(&receiver, &old_peer, &receiver_addr, &peer_addr);
+    assert_eq!(
+        block_on(receiver.store.get_session(&status_key)).unwrap(),
+        Some(old_status)
+    );
+    status_connect(&receiver, &new_peer, &receiver_addr, &peer_addr);
+    assert!(
+        block_on(receiver.store.get_session(&status_key))
+            .unwrap()
+            .is_none()
+    );
+    let expected = padded(&text("authored new chat"));
+    let sent = block_on(receiver.ops.encrypt(&peer_addr, &expected)).unwrap();
+    assert_eq!(
+        block_on(new_peer.ops.decrypt(
+            &receiver_addr,
+            sent.kind,
+            &sent.ciphertext,
+            status_identity(&receiver_addr)
+        ))
+        .unwrap()
+        .plaintext,
+        expected
+    );
+}
+
+#[test]
+fn delayed_archived_prekey_does_not_discard_a_sibling_with_the_accepted_identity() {
+    let old_peer = device("delayed-old-peer");
+    let new_peer = device("delayed-new-peer");
+    let receiver = device("delayed-receiver");
+    let peer_addr = address("111");
+    let receiver_addr = address("222");
+    status_connect(&old_peer, &receiver, &peer_addr, &receiver_addr);
+    let first = block_on(
+        old_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored first chat"))),
+    )
+    .unwrap();
+    block_on(receiver.ops.decrypt(
+        &peer_addr,
+        first.kind,
+        &first.ciphertext,
+        status_identity(&peer_addr),
+    ))
+    .unwrap();
+    let delayed = block_on(
+        old_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored delayed chat"))),
+    )
+    .unwrap();
+    let old_device_identity = status_identity(&peer_addr);
+    // The new bundle archives the old chat ratchet, while the status peer uses B.
+    status_connect(&receiver, &new_peer, &receiver_addr, &peer_addr);
+    status_connect(&new_peer, &receiver, &peer_addr, &receiver_addr);
+    let status = block_on(
+        new_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored new status"))),
+    )
+    .unwrap();
+    message(
+        block_on(receiver.ops.receive_status(
+            request(
+                "status@broadcast",
+                &peer_addr,
+                kind(&status),
+                &status.ciphertext,
+                false,
+            ),
+            true,
+        ))
+        .unwrap(),
+    );
+    let key = format!("{}_status", peer_addr.as_str());
+    let retained = block_on(receiver.store.get_session(&key)).unwrap().unwrap();
+    block_on(receiver.ops.decrypt(
+        &peer_addr,
+        delayed.kind,
+        &delayed.ciphertext,
+        old_device_identity,
+    ))
+    .unwrap();
+    assert_eq!(
+        block_on(receiver.store.get_session(&key)).unwrap(),
+        Some(retained.clone())
+    );
+    block_on(
+        receiver
+            .ops
+            .encrypt(&peer_addr, &padded(&text("authored archived reply"))),
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(receiver.store.get_session(&key)).unwrap(),
+        Some(retained.clone())
+    );
+    status_connect(&receiver, &new_peer, &receiver_addr, &peer_addr);
+    assert_eq!(
+        block_on(receiver.store.get_session(&key)).unwrap(),
+        Some(retained)
     );
 }

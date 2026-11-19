@@ -60,6 +60,8 @@ pub enum Received {
     /// Delivered before; the client only needs to send its receipt again.
     AlreadyDelivered {
         receipt_key: String,
+        /// Classification retained in the delivered marker, without plaintext.
+        group_status_wrapper: Option<bool>,
     },
 }
 
@@ -83,7 +85,7 @@ pub struct ReceivedMessage {
     pub app_state_key_share: Option<wa::message::AppStateSyncKeyShare>,
 }
 
-fn receipt_key(request: &ReceiveRequest<'_>) -> String {
+fn receipt_key(request: &ReceiveRequest<'_>, status_session: bool) -> String {
     let mut hasher = Sha256::new();
     for part in [
         request.kind.as_str().as_bytes(),
@@ -92,6 +94,9 @@ fn receipt_key(request: &ReceiveRequest<'_>) -> String {
     ] {
         hasher.update(part);
         hasher.update([0]);
+    }
+    if status_session {
+        hasher.update(b"status-session\0");
     }
     hasher.update(request.ciphertext);
     hex::encode(hasher.finalize())
@@ -152,14 +157,18 @@ impl BufferEntry {
         })
     }
 
-    fn delivered(inserted_ms: u64) -> Self {
+    fn delivered(inserted_ms: u64, group_status_wrapper: Option<bool>) -> Self {
         Self {
             state: STATE_DELIVERED,
             padding_version: 0,
             identity_changed: false,
             sender_key_rejected: false,
             inserted_ms,
-            padded_plaintext: Vec::new(),
+            // A delivered marker never carries message content. Older readers
+            // ignore its trailing metadata; empty legacy markers stay unknown.
+            padded_plaintext: group_status_wrapper
+                .map(|flag| vec![u8::from(flag)])
+                .unwrap_or_default(),
         }
     }
 }
@@ -214,7 +223,27 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Decrypt, buffer and classify one received payload. Sender-key
     /// distributions inside it are stored in the same batch as the decrypt.
     pub async fn receive(&self, request: ReceiveRequest<'_>) -> Result<Received, OpsError> {
-        let receipt_key = receipt_key(&request);
+        self.receive_scoped(request, false).await
+    }
+
+    /// Receive a status using a separate pairwise session when selected by
+    /// the caller's served configuration. Identity/prekeys and sender keys
+    /// remain shared. This does not enable status publishing.
+    pub async fn receive_status(
+        &self,
+        request: ReceiveRequest<'_>,
+        status_session: bool,
+    ) -> Result<Received, OpsError> {
+        let pairwise_status = status_session && request.kind != ReceiveKind::SenderKey;
+        self.receive_scoped(request, pairwise_status).await
+    }
+
+    async fn receive_scoped(
+        &self,
+        request: ReceiveRequest<'_>,
+        status_session: bool,
+    ) -> Result<Received, OpsError> {
+        let receipt_key = receipt_key(&request, status_session);
         // Pairwise payloads can carry a sender-key distribution for this chat,
         // so they also lock the sender's chain.
         let chain = chain_key(request.chat, request.sender.as_str());
@@ -250,7 +279,14 @@ impl<S: ServiceStore> SignalOps<S> {
             {
                 let entry = BufferEntry::decode(bytes)?;
                 if entry.state == STATE_DELIVERED {
-                    return Ok(Received::AlreadyDelivered { receipt_key });
+                    return Ok(Received::AlreadyDelivered {
+                        receipt_key,
+                        group_status_wrapper: match entry.padded_plaintext.as_slice() {
+                            [0] => Some(false),
+                            [1] => Some(true),
+                            _ => None,
+                        },
+                    });
                 }
                 let content = classify(&entry.padded_plaintext, entry.padding_version, from_me)?;
                 return Ok(Received::Message(Box::new(ReceivedMessage {
@@ -272,12 +308,13 @@ impl<S: ServiceStore> SignalOps<S> {
                         EncKind::Message
                     };
                     let decrypted = self
-                        .decrypt_into(
+                        .decrypt_into_scoped(
                             &staged,
                             request.sender,
                             kind,
                             request.ciphertext,
                             request.device_identity,
+                            status_session,
                         )
                         .await?;
                     (decrypted.plaintext, decrypted.identity_changed)
@@ -304,7 +341,7 @@ impl<S: ServiceStore> SignalOps<S> {
                         .put_aux(
                             Namespace::DecryptBuffer,
                             &receipt_key,
-                            &BufferEntry::delivered(inserted_ms).encode(),
+                            &BufferEntry::delivered(inserted_ms, None).encode(),
                         )
                         .await?;
                     staged.commit().await?;
@@ -384,7 +421,13 @@ impl<S: ServiceStore> SignalOps<S> {
                     .put_aux(
                         Namespace::DecryptBuffer,
                         receipt_key,
-                        &BufferEntry::delivered(entry.inserted_ms).encode(),
+                        &BufferEntry::delivered(
+                            entry.inserted_ms,
+                            classify(&entry.padded_plaintext, entry.padding_version, true)
+                                .ok()
+                                .map(|content| content.message.group_status_message_v2.is_set()),
+                        )
+                        .encode(),
                     )
                     .await?;
             }
