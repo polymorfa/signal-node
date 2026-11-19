@@ -2332,7 +2332,7 @@ async fn cold_status_identity_case_at(
         .unwrap();
     let status_key = format!("{}_status", address.as_str());
     assert!(store.get_session(&status_key).await.unwrap().is_some());
-    if route == "retry" {
+    if matches!(route, "retry" | "warm-retry") {
         let initial = FakeClient {
             device_identities: HashMap::from([(peer.clone(), peer_pair.device_identity.clone())]),
             devices: vec![peer.clone()],
@@ -2349,12 +2349,17 @@ async fn cold_status_identity_case_at(
             )
             .await
             .unwrap();
-        store.delete_session(address.as_str()).await.unwrap();
+        if route == "retry" {
+            store.delete_session(address.as_str()).await.unwrap();
+        }
     }
     let healthy_jid: Jid = "222:2@s.whatsapp.net".parse().unwrap();
     let healthy = device("authored-healthy-device", &healthy_jid.to_string()).await;
     let healthy_identity = common::pair_under(&healthy, &peer_pair.account_keys).await;
     let before_chat = store.get_session(address.as_str()).await.unwrap();
+    if route == "warm-retry" {
+        assert!(before_chat.is_some());
+    }
     let before_status = store.get_session(&status_key).await.unwrap();
     let before_identity = store.load_identity(address.as_str()).await.unwrap();
     records
@@ -2406,7 +2411,7 @@ async fn cold_status_identity_case_at(
             )
             .await
             .map(|_| ()),
-        _ => receiver
+        "retry" | "warm-retry" => receiver
             .resend(
                 &client,
                 RetryRequest {
@@ -2421,6 +2426,7 @@ async fn cold_status_identity_case_at(
             )
             .await
             .map(|_| ()),
+        _ => panic!("unknown fixture route: {route}"),
     };
     if fail_sibling || fail_identity {
         if fenced {
@@ -2542,4 +2548,9 @@ async fn failed_identity_read_keeps_the_group_fence_refusal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_identity_read_keeps_the_fence_refusal_for_the_only_recipient() {
     cold_status_identity_case_at("direct", false, true, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_encryption_preserves_a_lost_fence_from_identity_storage() {
+    cold_status_identity_case_at("warm-retry", false, true, true, false).await;
 }

@@ -1131,7 +1131,7 @@ impl<S: ServiceStore> SignalOps<S> {
             };
             let mut sessions = self.stores_over(staged.clone()).await;
             let mut identities = sessions.clone();
-            let node = prepare_pairwise_retry_stanza(
+            let prepared = prepare_pairwise_retry_stanza(
                 &mut sessions,
                 &mut identities,
                 PairwiseRetryRequest {
@@ -1145,9 +1145,9 @@ impl<S: ServiceStore> SignalOps<S> {
                     pre_encoded: None,
                 },
             )
-            .await
-            .map_err(send_error)?;
+            .await;
             sessions.ensure_finalized()?;
+            let node = prepared.map_err(send_error)?;
             staged.commit().await?;
             wacore_binary::marshal(&node)
                 .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))
