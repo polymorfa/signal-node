@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! signal-node: the self-hosted Signal service for Polymorfa
-//! zero-knowledge sessions.
+//! zero-knowledge connections.
 
 pub mod config;
 pub mod delivery;
@@ -33,7 +33,7 @@ pub struct Running {
 }
 
 impl Running {
-    /// Release every session, then stop.
+    /// Release every connection, then stop.
     pub async fn shutdown(mut self) {
         // Open SSE streams or a stalled peer cannot hold shutdown forever.
         // Aborting after this deadline leaves any unreleased lease to expire.

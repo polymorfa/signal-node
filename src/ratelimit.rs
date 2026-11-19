@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Client-side send ceiling: at most `limit` sends in any one-second window
-//! per session, matching `Welcome.max_sends_per_second`. Polymorfa enforces
+//! per connection, matching `Welcome.max_sends_per_second`. Polymorfa enforces
 //! the same ceiling and answers `CODE_RATE_LIMITED` past it; pacing here
 //! keeps a burst from the application from turning into refused sends.
 

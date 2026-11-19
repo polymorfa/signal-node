@@ -24,7 +24,7 @@ pub struct Event {
     /// `message`, `status.received` or `history.sync`.
     #[serde(rename = "type")]
     pub kind: &'static str,
-    pub session_id: String,
+    pub connection_id: String,
     /// Publication audience; replies and mentions remain ordinary messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_scope: Option<String>,

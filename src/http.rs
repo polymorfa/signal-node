@@ -32,8 +32,8 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
 
 pub fn router(node: Arc<Node>) -> Router {
     let api = Router::new()
-        .route("/v1/sessions", get(list_sessions))
-        .route("/v1/sessions/{id}/messages", post(send_message))
+        .route("/v1/connections", get(list_connections))
+        .route("/v1/connections/{id}/messages", post(send_message))
         .route("/v1/events", get(events))
         .route("/v1/events/{id}/ack", post(ack))
         .layer(middleware::from_fn_with_state(node.clone(), authenticate));
@@ -75,20 +75,20 @@ async fn health(State(node): State<Arc<Node>>) -> Response {
 }
 
 #[derive(Serialize)]
-struct SessionInfo {
+struct ConnectionInfo {
     id: String,
     lease_generation: u64,
     claimed: bool,
     has_device_keys: bool,
     #[serde(flatten)]
-    view: crate::node::SessionView,
+    view: crate::node::ConnectionView,
 }
 
-async fn list_sessions(State(node): State<Arc<Node>>) -> Response {
-    let sessions: Vec<SessionInfo> = node
-        .sessions()
+async fn list_connections(State(node): State<Arc<Node>>) -> Response {
+    let connections: Vec<ConnectionInfo> = node
+        .connections()
         .into_iter()
-        .map(|s| SessionInfo {
+        .map(|s| ConnectionInfo {
             id: s.id.clone(),
             lease_generation: s.generation,
             claimed: s.is_claimed(),
@@ -96,7 +96,7 @@ async fn list_sessions(State(node): State<Arc<Node>>) -> Response {
             view: s.view(),
         })
         .collect();
-    Json(json!({ "node_id": node.cfg.node_id, "sessions": sessions })).into_response()
+    Json(json!({ "node_id": node.cfg.node_id, "connections": connections })).into_response()
 }
 
 async fn send_message(
@@ -111,18 +111,18 @@ async fn send_message(
     if !node.is_configured(&id) {
         return error(
             StatusCode::NOT_FOUND,
-            "unknown_session",
-            "session is not configured",
+            "unknown_connection",
+            "connection is not configured",
         );
     }
-    let Some(session) = node.session(&id) else {
+    let Some(connection) = node.connection(&id) else {
         return error(
             StatusCode::CONFLICT,
             "not_lease_holder",
-            "another node serves this session; send through that node",
+            "another node serves this connection; send through that node",
         );
     };
-    match send::send(&node, &session, request).await {
+    match send::send(&node, &connection, request).await {
         Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
         Err(SendError::Unconfirmed { message_id }) => (
             StatusCode::GATEWAY_TIMEOUT,
@@ -137,12 +137,12 @@ async fn send_message(
             let (status, code) = match &e {
                 SendError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
                 SendError::NotLeaseHolder => (StatusCode::CONFLICT, "not_lease_holder"),
-                SendError::NotPaired => (StatusCode::CONFLICT, "session_not_paired"),
+                SendError::NotPaired => (StatusCode::CONFLICT, "connection_not_paired"),
                 SendError::Disconnected => (StatusCode::SERVICE_UNAVAILABLE, "disconnected"),
                 SendError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
                 SendError::Refused(err) => match err.code_enum() {
-                    crate::proto::Code::SessionUnavailable => {
-                        (StatusCode::CONFLICT, "session_unavailable")
+                    crate::proto::Code::ConnectionUnavailable => {
+                        (StatusCode::CONFLICT, "connection_unavailable")
                     }
                     crate::proto::Code::Refused => (StatusCode::FORBIDDEN, "refused"),
                     crate::proto::Code::Unavailable => {
@@ -162,8 +162,9 @@ async fn send_message(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventFilter {
-    session_id: Option<String>,
+    connection_id: Option<String>,
 }
 
 // An error Response is the standard axum handler shape; it is built only on refusal.
@@ -172,7 +173,7 @@ async fn events(
     State(node): State<Arc<Node>>,
     Query(filter): Query<EventFilter>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, Response> {
-    let Some(rx) = node.delivery.subscribe_for(filter.session_id) else {
+    let Some(rx) = node.delivery.subscribe_for(filter.connection_id) else {
         return Err(error(
             StatusCode::NOT_FOUND,
             "stream_disabled",

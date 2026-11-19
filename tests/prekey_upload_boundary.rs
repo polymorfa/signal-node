@@ -58,7 +58,7 @@ impl Database {
         }
     }
     // Inject a real SQL error at pending publication or ACK receipt insertion.
-    // Conditions isolate this trigger to the test's random session scope.
+    // Conditions isolate this trigger to the test's random connection scope.
     async fn fail_on(&self, scope: &str, key: &str) {
         let token = scope.strip_prefix("upload_").unwrap();
         let key = hex::encode(key);
@@ -129,7 +129,7 @@ impl Database {
 
 fn request(scope: &str, generation: u64, op: Op) -> proto::RunnerRequest {
     proto::RunnerRequest {
-        session_id: scope.into(),
+        connection_id: scope.into(),
         lease_generation: generation,
         op: Some(op),
     }
@@ -142,13 +142,19 @@ async fn start(
     ttl: u64,
 ) -> signal_node::Running {
     let mut cfg = config(name, &hub.url, false);
-    cfg.sessions = vec![scope.into()];
+    cfg.connections = vec![scope.into()];
     cfg.lease_ttl_ms = ttl;
     // Keep fixture reacquisition within Hub's five-second test deadline;
     // bulk SQL work still gets the configured, unchanged lease TTL.
     cfg.lease_renew = Duration::from_millis((ttl / 4).min(100));
     let running = signal_node::start(cfg, backend).await.unwrap();
-    wait(|| running.node.session(scope).is_some_and(|s| s.is_claimed())).await;
+    wait(|| {
+        running
+            .node
+            .connection(scope)
+            .is_some_and(|s| s.is_claimed())
+    })
+    .await;
     running
 }
 fn result(frame: proto::Frame) -> Out {
@@ -234,7 +240,7 @@ fn ack(batch: &proto::PreKeyUploadBatch, ids: Vec<u32>) -> Op {
 #[derive(prost::Message)]
 struct FutureRequest {
     #[prost(string, tag = "1")]
-    session_id: String,
+    connection_id: String,
     #[prost(uint64, tag = "2")]
     lease_generation: u64,
     #[prost(bytes = "vec", tag = "99")]
@@ -245,7 +251,7 @@ struct FutureRequest {
 #[derive(prost::Message)]
 struct OldRequest {
     #[prost(string, tag = "1")]
-    session_id: String,
+    connection_id: String,
     #[prost(uint64, tag = "2")]
     lease_generation: u64,
     #[prost(message, optional, tag = "11")]
@@ -260,11 +266,11 @@ async fn consume_pending(
     batch: &proto::PreKeyUploadBatch,
     identity: proto::Identity,
 ) {
-    let generation = running.node.session(scope).unwrap().generation;
+    let generation = running.node.connection(scope).unwrap().generation;
     let (sender, sender_bundle) = peer("upload-sender-fixture").await;
     let target: wacore_binary::Jid = "222:1@s.whatsapp.net".parse().unwrap();
     // The node is a paired companion; each side pins the other's account.
-    let node_ops = running.node.session(scope).unwrap().ops().unwrap();
+    let node_ops = running.node.connection(scope).unwrap().ops().unwrap();
     let node = pair(&*node_ops).await;
     vouch(&sender, "222:1@s.whatsapp.net", &node.device_identity).await;
     vouch(
@@ -378,7 +384,7 @@ async fn exercise_database(db: Database) {
     let hub = Hub::start().await;
     let backend = db.reopen().await;
     let first = start(&hub, "upload-first", &scope, backend.clone(), 30_000).await;
-    let generation = first.node.session(&scope).unwrap().generation;
+    let generation = first.node.connection(&scope).unwrap().generation;
     let init = hub
         .request(
             "upload-first",
@@ -448,7 +454,7 @@ async fn exercise_database(db: Database) {
 
     let backend = db.reopen().await;
     let second = start(&hub, "upload-second", &scope, backend.clone(), 30_000).await;
-    let generation2 = second.node.session(&scope).unwrap().generation;
+    let generation2 = second.node.connection(&scope).unwrap().generation;
     assert!(generation2 > generation);
     assert_eq!(
         prepare(&hub, "upload-second", &scope, generation2, 50).await,
@@ -490,7 +496,7 @@ async fn exercise_database(db: Database) {
         hub.raw_request(
             "upload-second",
             FutureRequest {
-                session_id: scope.clone(),
+                connection_id: scope.clone(),
                 lease_generation: generation2,
                 future_operation: vec![1],
             }
@@ -641,7 +647,7 @@ async fn exercise_database(db: Database) {
 
     let backend = db.reopen().await;
     let third = start(&hub, "upload-third", &scope, backend.clone(), 30_000).await;
-    let generation3 = third.node.session(&scope).unwrap().generation;
+    let generation3 = third.node.connection(&scope).unwrap().generation;
     assert!(generation3 > generation2);
     let next = prepare(&hub, "upload-third", &scope, generation3, 2).await;
     assert_ne!(next.batch_id, batch.batch_id);
@@ -699,7 +705,7 @@ async fn durable_batch_survives_process_crash_and_refuses_the_old_holder() {
     let hub = Hub::start().await;
     let backend = db.reopen().await;
     let first = start(&hub, "upload-crash-first", &scope, backend.clone(), 500).await;
-    let generation = first.node.session(&scope).unwrap().generation;
+    let generation = first.node.connection(&scope).unwrap().generation;
     result(
         hub.request(
             "upload-crash-first",
@@ -708,11 +714,11 @@ async fn durable_batch_survives_process_crash_and_refuses_the_old_holder() {
         .await,
     );
     let batch = prepare(&hub, "upload-crash-first", &scope, generation, 3).await;
-    let stale_ops = first.node.session(&scope).unwrap().ops().unwrap();
+    let stale_ops = first.node.connection(&scope).unwrap().ops().unwrap();
     first.abort();
     tokio::time::sleep(Duration::from_millis(650)).await;
     let second = start(&hub, "upload-crash-second", &scope, db.reopen().await, 500).await;
-    let generation2 = second.node.session(&scope).unwrap().generation;
+    let generation2 = second.node.connection(&scope).unwrap().generation;
     assert!(generation2 > generation);
     assert_eq!(
         prepare(&hub, "upload-crash-second", &scope, generation2, 1).await,
@@ -788,7 +794,7 @@ async fn malformed_and_oversized_frames_do_not_allocate_or_lose_the_pending_batc
     let hub = Hub::start().await;
     let backend = db.reopen().await;
     let running = start(&hub, "upload-framing", &scope, backend.clone(), 30_000).await;
-    let generation = running.node.session(&scope).unwrap().generation;
+    let generation = running.node.connection(&scope).unwrap().generation;
     result(
         hub.request(
             "upload-framing",
@@ -810,11 +816,11 @@ async fn malformed_and_oversized_frames_do_not_allocate_or_lose_the_pending_batc
     wait(|| {
         running
             .node
-            .session(&scope)
+            .connection(&scope)
             .is_some_and(|s| s.generation > generation && s.is_claimed())
     })
     .await;
-    let successor = running.node.session(&scope).unwrap().generation;
+    let successor = running.node.connection(&scope).unwrap().generation;
     assert_eq!(
         prepare(&hub, "upload-framing", &scope, successor, 50).await,
         batch

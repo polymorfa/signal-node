@@ -1,5 +1,5 @@
 // Contract between Polymorfa's WhatsApp runner and a customer-run Signal
-// service for zero-knowledge (ZK) sessions.
+// service for zero-knowledge (ZK) connections.
 //
 // The Signal service holds a linked device's Signal private keys, sessions
 // and message plaintext. Polymorfa keeps the WhatsApp connection and asks the
@@ -13,18 +13,18 @@
 //   Authorization header. Polymorfa never connects to the service.
 // - Each binary WebSocket message is exactly one Frame.
 // - Both sides send requests. A request carries an id unique per sender per
-//   connection; its response or Error carries the same id. Requests may be
+//   WebSocket link; its response or Error carries the same id. Requests may be
 //   answered out of order.
-// - One connection serves any number of sessions. Every session-scoped
-//   request names the session and the lease generation it was sent under.
+// - One WebSocket link serves any number of Connections. Every account-scoped
+//   request names the Connection and the lease generation it was sent under.
 //
 // Leases and fencing
-// - Before Polymorfa routes a session's operations to a connection, the
-//   service claims the session with ClaimSession, giving the generation of
-//   the lease it holds in its own store. Polymorfa routes the session to the
+// - Before Polymorfa routes a Connection's operations to a service link, the
+//   service claims the Connection with ClaimConnection and its stored lease
+//   generation. Polymorfa routes the Connection to the
 //   highest generation it has accepted and rejects claims and requests at a
 //   lower generation with CODE_NOT_LEASE_HOLDER.
-// - While no connection holds a session, the session is paused: Polymorfa
+// - While no service link holds a Connection, the Connection is paused: Polymorfa
 //   stops reading messages for it and resumes when a service claims it.
 //
 // Versioning
@@ -40,7 +40,7 @@ option go_package = "github.com/polymorfa/polymorfa/apps/api/gen/proto/polymorfa
 // Frame is one WebSocket message.
 message Frame {
   // Request id, or the id of the request this frame answers. Zero for
-  // Hello, Welcome and SessionEvent.
+  // Hello, Welcome and ConnectionEvent.
   uint64 id = 1;
 
   oneof body {
@@ -59,7 +59,7 @@ message Frame {
     // Either direction. Answers a request that failed.
     Error error = 8;
     // Polymorfa → service. Unsolicited; never answered.
-    SessionEvent session_event = 9;
+    ConnectionEvent connection_event = 9;
   }
 }
 
@@ -74,18 +74,18 @@ message Hello {
 
 message Welcome {
   uint32 protocol_version = 1;
-  // Project the credential belongs to. Sessions outside it are refused.
+  // Project the credential belongs to. Connections outside it are refused.
   string project_id = 2;
   // The service sends a Ping at least this often; Polymorfa closes a silent
   // connection after three intervals.
   uint32 heartbeat_interval_ms = 3;
-  // Ceiling on SendStanza requests per session per second.
+  // Ceiling on SendStanza requests per connection per second.
   uint32 max_sends_per_second = 4;
 }
 
 // RunnerRequest is an operation Polymorfa's runner needs from the service.
 message RunnerRequest {
-  string session_id = 1;
+  string connection_id = 1;
   uint64 lease_generation = 2;
 
   oneof op {
@@ -124,13 +124,13 @@ message ServiceResponse {
 // ServiceRequest is something the service needs from Polymorfa, chiefly to
 // send messages it built.
 message ServiceRequest {
-  string session_id = 1;
-  // Zero for ClaimSession and Ping.
+  string connection_id = 1;
+  // Zero for ClaimConnection and Ping.
   uint64 lease_generation = 2;
 
   oneof op {
-    ClaimSession claim_session = 10;
-    ReleaseSession release_session = 11;
+    ClaimConnection claim_connection = 10;
+    ReleaseConnection release_connection = 11;
     SendStanza send_stanza = 12;
     ResolveDevices resolve_devices = 13;
     FetchPreKeys fetch_pre_keys = 14;
@@ -142,7 +142,7 @@ message ServiceRequest {
 message RunnerResponse {
   oneof result {
     Ok ok = 10;
-    SessionClaimed session_claimed = 11;
+    ConnectionClaimed connection_claimed = 11;
     SendResult send = 12;
     Devices devices = 13;
     Bundles bundles = 14;
@@ -158,7 +158,7 @@ message Error {
     // A dependency is down (database, WhatsApp connection). Retry later.
     CODE_UNAVAILABLE = 2;
     CODE_INVALID_ARGUMENT = 3;
-    // The request's lease generation is not the current one for the session.
+    // The request's lease generation is not the current one for the connection.
     CODE_NOT_LEASE_HOLDER = 4;
     // Receive only: the payload could not be decrypted. See decrypt_failure.
     CODE_DECRYPT_FAILED = 5;
@@ -166,9 +166,9 @@ message Error {
     CODE_UNSUPPORTED = 6;
     // SendStanza exceeded Welcome.max_sends_per_second.
     CODE_RATE_LIMITED = 7;
-    // The session is not paired, logged out, or not in this project.
-    CODE_SESSION_UNAVAILABLE = 8;
-    // The operation is refused: for zero-knowledge sessions (for example a
+    // The connection is not paired, logged out, or not in this project.
+    CODE_CONNECTION_UNAVAILABLE = 8;
+    // The operation is refused: for zero-knowledge connections (for example a
     // Campaign send), or because a recipient device's identity did not verify
     // against its account.
     CODE_REFUSED = 9;
@@ -183,7 +183,7 @@ message Error {
 enum DecryptFailure {
   // Any other failure; the runner sends a retry receipt.
   DECRYPT_FAILURE_UNSPECIFIED = 0;
-  // Older than the session can decrypt; ignore the payload.
+  // Older than the Signal session can decrypt; ignore the payload.
   DECRYPT_FAILURE_OLD_COUNTER = 1;
   // Group message without a sender key.
   DECRYPT_FAILURE_NO_SENDER_KEY = 2;
@@ -341,7 +341,7 @@ message Resend {
   // "pn" or "lid"; empty when not a group.
   string addressing_mode = 8;
   uint32 retry_count = 9;
-  // Keys carried by the retry receipt, to start a fresh session.
+  // Keys carried by the retry receipt, to start a fresh Signal session.
   Bundle bundle = 10;
 }
 
@@ -366,25 +366,25 @@ message MigrateResult {
 
 // ─── Service → runner operations ────────────────────────────────────────
 
-message ClaimSession {
+message ClaimConnection {
   // Generation of the lease the service holds in its own store. Must be
   // greater than or equal to any generation Polymorfa accepted before.
   uint64 generation = 1;
 }
 
-message SessionClaimed {
-  // Polymorfa's view of the session when the claim was accepted.
-  SessionEvent.State state = 1;
+message ConnectionClaimed {
+  // Polymorfa's view of the connection when the claim was accepted.
+  ConnectionEvent.State state = 1;
   // This device's JIDs once paired.
   string pn = 2;
   string lid = 3;
 }
 
-message ReleaseSession {}
+message ReleaseConnection {}
 
 // SendStanza transmits a message stanza the service built. Polymorfa checks
-// the stanza is a <message> for this session, applies the send ceiling and
-// session safety pacing, and waits for the server acknowledgement.
+// the stanza is a <message> for this connection, applies the send ceiling and
+// connection safety pacing, and waits for the server acknowledgement.
 message SendStanza {
   bytes node = 1;
   // Participant hash the stanza was built for (groups), to report a
@@ -448,7 +448,7 @@ message Ping {}
 
 // ─── Notifications ──────────────────────────────────────────────────────
 
-message SessionEvent {
+message ConnectionEvent {
   enum State {
     STATE_UNSPECIFIED = 0;
     // Waiting for the QR code to be scanned.
@@ -456,12 +456,12 @@ message SessionEvent {
     STATE_CONNECTED = 2;
     // Reconnecting to WhatsApp.
     STATE_DISCONNECTED = 3;
-    // No Signal service holds the session; messages are held by WhatsApp.
+    // No Signal service holds the connection; messages are held by WhatsApp.
     STATE_PAUSED = 4;
-    // Unlinked. The service may delete the session's state.
+    // Unlinked. The service may delete the connection's state.
     STATE_LOGGED_OUT = 5;
   }
-  string session_id = 1;
+  string connection_id = 1;
   State state = 2;
   string pn = 3;
   string lid = 4;

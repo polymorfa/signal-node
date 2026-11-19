@@ -1,45 +1,102 @@
-# Producer integration status
+# Signal service integration status
 
-This service implements the accepted server-mode contract. It does not establish deployed zero-knowledge availability or browser remote transport support. Source revisions remain explicit: runner protocol originates at signal-node `b6d5f5f` and adds durable public upload requests 20/21 and response 18 without changing protocol version 1; the Signal core is pinned to `oxidezap/whatsapp-rust` revision `2671430db6161c01c507587d0e3c90dcf153aa85`, while recordstore and Signal operations are local workspace crates. The unchanged service OpenAPI artifact is the application/native-client contract.
+The service is private and unmerged. Local verification does not establish live
+WhatsApp, hosted transport, deployment or package availability. This Connection
+candidate preserves rename source `61209057729b002a2122b898d744a8813a702fc7` and
+implementation PR [#1](https://github.com/polymorfa/signal-node/pull/1) target
+`4d9694eaf97deca34c78990d1293b2b533e19d17`. Its existing PR
+[#3](https://github.com/polymorfa/signal-node/pull/3) targets
+`feat/signal-service-completion-20261014`, not `main`. Attribution PR #2 is separate.
 
-## Mandatory six-part assessment
+## Producer and client ABI
 
-| Part | Status | Evidence / remaining owner |
-| --- | --- | --- |
-| API | Updated locally; upstream integration blocked | Additive protobuf upload prepare/ACK and full-batch response; local HTTP/OpenAPI, Origin rejection and SSE/ACK contract unchanged by this checkpoint. Backend PR #593 and HyperMeow own exact wire consumption, live authorization and real runner acceptance. |
-| SDKs | Application HTTP unaffected by this wire addition; program integration remains coordinated | Native application clients do not implement private runner prekey operations or import the AGPL core. Parent coordinates TypeScript and five handwritten native consumers against exact application pins. The separate WASM producer shares the guarded core API; no private service proto belongs in MIT SDKs. |
-| CLI | Updated service CLI; Polymorfa CLI blocked | `--config`, `--help`, `--version`, private operator key generation and SIGINT/SIGTERM shutdown. Customer CLI must consume accepted SDK/backend revisions; this producer does not edit that repository. |
-| Docs | Updated operator/API docs; public release docs blocked | README, example configuration, OpenAPI and this integration record. Parent owns Mintlify guides, language pages, Help Center and release-appropriate changelog. No local draft date is presented as a shipped release. |
-| Feature releases | Blocked for release | Backend owns beta eligibility/flag/enrollment/entitlement enforcement. Service does not grant access or change rollout controls. No publication, visibility, tags or production flag edits. Unmerged library producer, real-provider acceptance and legal review remain gates. |
-| Admin controls | Unaffected within service authority; backend integration blocked | No customer/control-plane state or staff action is added here. Keys/plaintext remain customer-side. Backend PR #593 owns counts-only transport diagnostics and existing eligibility/disable controls; no new admin credential or direct database authority. |
-
-## All fourteen program layers
-
-| Layer | Service slice status / dependency |
+| Boundary | Current source and contract |
 | --- | --- |
-| 1. Libraries | Core uses exact upstream `2671430db6161c01c507587d0e3c90dcf153aa85`; normal/dev operations and recordstore use the same local workspace source. Durable atomic upload batches, exact replay ACK and fresh-only legacy marks consumed without a private-format parser. No library rewrite or publication here. |
-| 1b. Signal service | Additive durable upload dispatch and core-backed local uploaded count; real framed SQLite/PostgreSQL recovery and rollback tests. HTTP routes, consent, key custody and runtime policy unchanged. |
-| 2. Runners / Bartender | HyperMeow explicit batch interface and backend PR #593 wire/vendor integration remain pending. Unknown operations fail Unsupported without fresh-generation fallback. Fake WS is not a live runner; Bartender unchanged. |
-| 3. Temporal | Parent/backend owner assesses workflows and transport recovery; this process creates no Temporal workflow or control-plane command. |
-| 4. Customer API | Backend PR #593 owns mode, consent, refusal and project authority. Local API cannot bypass them. |
-| 5. Admin API | Backend owns bounded diagnostics/capabilities. Service does not expose customer keys to staff. |
-| 6. Inspector | Parent owns real-account acceptance scenarios; local two-device fixture is not Inspector acceptance. |
-| 7. Console UI | Parent owns customer mode/consent/trade-off flow and backend integration. |
-| 8. Admin UI | Parent/backend owner integrates diagnostics through API-owned authority. No service management UI added. |
-| 9. SDKs | Parent coordinates TS + Go/Python/PHP/Rust/C# media/history/storage and sidecar clients against exact producer pins. |
-| 10. CLI | Service CLI updated. Polymorfa CLI integration remains with its owner. |
-| 11. Docs | Operator/API documentation updated here. Public Mintlify guides/references/language pages remain coordinated by parent. |
-| 12. Help Center | Parent owns consent and operational trade-off article; no shipped availability claim in this producer. |
-| 13. Marketing | Parent owns release-aligned copy; no announcement or availability claim authorized here. |
+| Signal core | `wacore`, `wacore-binary` and `waproto` use oxidezap/whatsapp-rust `2671430db6161c01c507587d0e3c90dcf153aa85`. |
+| Record store and Signal operations | Workspace crates under `crates/recordstore` and `crates/signal-ops`, preserved from target4d9694e. Their cryptographic sessions, trust/cancellation/prekey behavior and storage domains are not account-resource aliases. |
+| Toolchain and native checks | Rust1.95.0; accepted workspace/lock, CI matrix and Docker inputs remain. |
+| Runner protocol | `proto/polymorfa/signal/v1/signal_service.proto`, protocol1 and subprotocol `polymorfa.signal.v1`. Account symbols change; numeric tags, types, enum values and oneof positions remain. |
+| Companion identity | Accepted target adds `Receive.device_identity` tag10 and `Bundle.device_identity` tag8. Bytes are forwarded to existing verification; they are not synthesized or substituted from the service's own identity. |
+| Application API | `docs/app-api.openapi.json`; `/v1/connections`, `connection_id` events/filter and canonical account errors. Actual phone and per-peer Signal session fields retain their meanings. |
+| Configuration | `polymorfa.connections`, `SIGNAL_NODE_CONNECTIONS`; stable configured selector values and local lease generations retain their values. |
 
-## Verification limits
+Account messages are `ClaimConnection`, `ReleaseConnection`, `ConnectionClaimed`
+and `ConnectionEvent`. The complete descriptor matches target4d9694e after only
+the exact account-name mapping, including the accepted companion additions.
+Two native wire regressions pin lease/event tags and companion byte fields.
+The unavailable-account enum remains numeric8. No account compatibility alias,
+retired HTTP route or permissive old event-filter reader is added.
 
-Native checks use Rust 1.95 and a dedicated real PostgreSQL fixture plus SQLite. The integration transport is a fake Polymorfa peer; actual Signal encryption/decryption runs on both devices. Tests cover application ACK before durable delivery, HMAC over exact bytes, webhook rejection/redirect, SSE duplicate waiters, sealed replay after crash, old-generation writes, expiry/reacquisition, slot authentication, history consent and send pacing.
+Signal ratchets, `Namespace::Session`, upstream Signal errors,
+`peer_data_request_session_id`, stored record keys, sealing domains, IDs and
+fences retain their meanings and bytes. Retry-receipt bundles establish a fresh
+Signal session, not a fresh account Connection. Application event IDs retain the
+accepted target's domain and length-prefixed account selector, so an ACK cannot
+complete another Connection's event.
 
-Durable-upload tests additionally prepare 812, reopen the service/store and request 50 while retaining the full original batch. Real SQL failures at pending publication and ACK receipt insertion roll back counter/private-key or uploaded-flag changes. An actual encrypted receive consumes a pending key, the app fsyncs its receipt before ACK, and the subsequent batch ACK cannot resurrect that key. Discarding a serialized ACK response, reopening and repeating the exact ACK leaves a newer pending batch unchanged. Partial, duplicate, foreign, malformed and stale acknowledgments fail; legacy marks refuse mixed/consumed pending members. Wire-tag fixtures preserve additive version-1 decoding. Malformed frames allocate nothing; a frame above the existing 16 MiB transport ceiling reconnects with a higher fence and recovers the pending batch.
+## Companion producer dependencies
 
-The existing `[app_state].share_keys` opt-in remains false by default and requires own-device evidence when enabled. That exception permits contact-name, label and mute/archive/pin metadata decryption; message plaintext custody does not promise metadata opacity. QuickLink admission, short-lived tunnel/grant authority, Temporal, standard-custody behavior, billing/metering, logging and hosted retention are unchanged. No public release record or feature-flag change is warranted for an unmerged private protocol producer; parent owns coordinated release documentation and availability gates.
+The pinned backend HyperMeow `c858e73f841a` does not carry these identity bytes
+through `RemoteReceive`, and its existing `prekey.Bundle` conversion does not
+supply the companion identity. Regeneration alone cannot populate them.
 
-Real WhatsApp pairing, media/history download, group resend, retry receipts and server redelivery have not been exercised. The participant-hash resend addresses every current device rather than WA Web's exclusion list; provider acceptance remains unresolved. Arbitrary clock skew, key rotation and same-slot rollback protection are not implemented. Browser remote relay is blocked pending distinct short-lived client grant authority. AGPL/legal review and owner approval are required before making this repository or artifacts public.
+Existing counterpart [HyperMeow #69](https://github.com/polymorfa/hypermeow/pull/69),
+head `4792d8dfc24c793711dd563079bba8fae787ec98`, adds
+`RemoteReceive.DeviceIdentity` for prekey messages and
+`FetchPreKeysWithIdentityNoError` / `FetchedPreKey.DeviceIdentity`. Existing bundle
+APIs stay unchanged; its shadow relay still has no identity bytes. This source
+has a separate human-maintainer and native/provider acceptance boundary.
 
-The status candidate composes the service owner's local-crate migration, pinned-account/device verification, sender-key holder rotation and session-scoped application event IDs. A newly accepted pairwise ratchet finalizes the sibling chat/status identity through the local store adapter; existing and archived ratchet updates preserve the sibling. Failed local finalization aborts a staged direct/group cohort before commit. Protocol 1 retains additive status operations, duplicate publication classification and ACK privacy. Candidate native, retained-state, PostgreSQL and release acceptance require their own exact-head receipts; earlier receipts do not cover this composition.
+The existing backend counterpart is [Polymorfa #1037](https://github.com/polymorfa/polymorfa/pull/1037),
+source `e8ab3e02b00f76b63c6918232e3ca7c6ddd8d6c0`, supplied by the family owner.
+It carries the narrow HyperMeow companion producer, receive/bundle projections,
+WebSocket regression and generated bindings. Root owns preserved integration into
+[Backend #1022](https://github.com/polymorfa/polymorfa/pull/1022) and regeneration
+against this exact final Signal proto. No monorepo/library pin, binding or runtime
+producer was edited in this service lane. Consumer composition remains pending;
+this document does not claim that the published backend already carries it.
+
+Cellar shipped-client evidence is bundle `whatsapp-1054794655`, indexed2026-11-16,
+with zero chunk/codegen failures and5719 unresolved dependencies.
+`WAWebMsgProcessingDecryptApi.js:24-39` passes received device identity into
+companion verification before decryption. `WAWebAdvSignatureApi.js:42-59,80-91`
+checks account/device signatures and selects the prekey verification path.
+These are shipped-client observations, not current server or live-provider
+acceptance. The service retains the target's verification and refusal gates;
+missing data does not justify bypassing them.
+
+## Verification and availability
+
+The preserved candidate passes178 workspace/all-target native tests with zero
+failed or ignored cases, including two new binary contract regressions. Tests
+use a dedicated real PostgreSQL16.14 instance, real SQLite, sealed state and
+actual synthetic-device Signal crypto with a framed fixture peer. Authentication,
+Origin rejection, canonical routes, rejected old filters, claim/generation fences,
+trust/cancellation, consent, prekey batch recovery and ACK isolation remain tested.
+Strict workspace/all-target Clippy, formatting and Buf lint/build pass.
+
+The actual debug binary reports `signal-node/0.1.0`. Release compilation is not
+attempted at the observed1.6GiB free disk. Docker runtime is unavailable locally;
+container/TLS/native provider acceptance remains hosted. Official MBX Cargo is
+used without manual cache, target, profile, cap or authentication changes.
+Automatic MBX collection is host-managed and remains in the command receipts.
+
+The customer API, six SDKs, CLI, integrations, Inspector, Console, Connect,
+Admin, docs and Help Center remain in the same coordinated family. This producer
+adds no eligibility, enrollment, feature flag, metering/financial authority,
+QuickLink/browser tunnel grant, staff authority or hosted history access. Existing
+app-state/history opt-ins and customer custody boundaries remain. Source API date
+and public-spec availability are owned by the family release record.
+
+Real pairing, send/receive/media/history/group/retry and retained/signed-state
+acceptance remain separate gates. Private AGPL/legal review, human notice/approval,
+exact merged source cohorts and owner publication authority remain. No merge,
+deployment, publication, provider configuration or main-only cutover occurs here.
+Rollback must preserve sealed/device/prekey state, event identity and fences;
+never reset keys or weaken verification to fit an older consumer.
+
+## Status publications
+
+This candidate composes the Connection rename with separate status receive handling. The application exposes `status.received` with `connection_id` and `status_scope`. Protocol version 1 retains the additive status operation and duplicate publication classification. Signal sessions, receipt keys and acknowledgment privacy keep their existing semantics.
+
+The workspace operations adapter finalizes sibling identity state when it accepts a new pairwise ratchet. Existing and archived ratchet updates preserve the sibling. Failed local finalization aborts staged direct or group sends and preserves lease refusal through wrapped errors. Prior checks do not establish native provider, PostgreSQL or previous-release retained-state acceptance for this composition.

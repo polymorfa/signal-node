@@ -114,10 +114,10 @@ impl Delivery {
         self.subscribe_for(None)
     }
 
-    /// Subscribe to one session, or all sessions when the filter is absent.
+    /// Subscribe to one connection, or all connections when the filter is absent.
     pub fn subscribe_for(
         &self,
-        session_id: Option<String>,
+        connection_id: Option<String>,
     ) -> Option<broadcast::Receiver<Arc<Event>>> {
         let mut streams = self
             .streams
@@ -127,7 +127,7 @@ impl Delivery {
         streams.retain(|_, stream| stream.receiver_count() > 0);
         Some(
             streams
-                .entry(session_id)
+                .entry(connection_id)
                 .or_insert_with(|| broadcast::channel(STREAM_BUFFER).0)
                 .subscribe(),
         )
@@ -158,7 +158,9 @@ impl Delivery {
                 registry.retain(|_, stream| stream.receiver_count() > 0);
                 registry
                     .iter()
-                    .filter(|(filter, _)| filter.as_ref().is_none_or(|id| *id == event.session_id))
+                    .filter(|(filter, _)| {
+                        filter.as_ref().is_none_or(|id| *id == event.connection_id)
+                    })
                     .map(|(_, stream)| stream.clone())
                     .collect()
             })
@@ -256,7 +258,7 @@ mod tests {
             id: id.into(),
             kind: "message",
             status_scope: None,
-            session_id: "s".into(),
+            connection_id: "s".into(),
             chat: "c".into(),
             sender: "x".into(),
             sender_alt: None,

@@ -2,16 +2,16 @@
 
 //! Key custody for server mode.
 //!
-//! The operator supplies one 256-bit master key. Each session has its own
-//! random 256-bit data key, stored in the session's records wrapped
+//! The operator supplies one 256-bit master key. Each connection has its own
+//! random 256-bit data key, stored in the connection's records wrapped
 //! (AES-256-GCM) by the master key. A node unwraps the data key once, when it
-//! takes the session's lease, and seals every record with it from then on.
+//! takes the connection's lease, and seals every record with it from then on.
 //! The master key never touches the database, and the data key is never
 //! stored unwrapped.
 //!
-//! The wrapped data key lives in the session's `device` namespace under
+//! The wrapped data key lives in the connection's `device` namespace under
 //! [`DATA_KEY_RECORD`]. It is written with an exclusive, fenced insert, so
-//! two nodes that race to initialise a session cannot both pick a key.
+//! two nodes that race to initialise a connection cannot both pick a key.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -28,9 +28,9 @@ const NONCE_LEN: usize = 12;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
-    #[error("the session's data key does not open with this master key")]
+    #[error("the connection's data key does not open with this master key")]
     WrongMasterKey,
-    #[error("the session's wrapped data key is malformed")]
+    #[error("the connection's wrapped data key is malformed")]
     Malformed,
     #[error("storage: {0}")]
     Store(#[from] wacore::store::error::StoreError),
