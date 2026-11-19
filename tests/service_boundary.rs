@@ -1500,6 +1500,15 @@ async fn encrypted_status_uses_scoped_session_and_separate_publication_event() {
             }))
         }))
     ));
+    let sender: wacore_binary::Jid = receive.sender.parse().unwrap();
+    let address = sender.to_protocol_address();
+    assert_eq!(
+        records
+            .scan_keys(CONNECTION, Namespace::Session, "", None)
+            .await
+            .unwrap(),
+        vec![format!("{}_status", address.as_str())],
+    );
     let again = hub
         .command(
             "node-status",

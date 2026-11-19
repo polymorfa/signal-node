@@ -234,12 +234,8 @@ impl<S: ServiceStore> SignalOps<S> {
         request: ReceiveRequest<'_>,
         status_session: bool,
     ) -> Result<Received, OpsError> {
-        if status_session && request.kind == ReceiveKind::SenderKey {
-            return Err(OpsError::InvalidInput(
-                "sender keys cannot use a pairwise status session".into(),
-            ));
-        }
-        self.receive_scoped(request, status_session).await
+        let pairwise_status = status_session && request.kind != ReceiveKind::SenderKey;
+        self.receive_scoped(request, pairwise_status).await
     }
 
     async fn receive_scoped(

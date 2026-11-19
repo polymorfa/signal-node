@@ -2243,13 +2243,14 @@ impl wacore_recordstore::RecordStore for BundleFaultRecords {
 }
 
 async fn cold_status_identity_case(route: &str, fail_sibling: bool) {
-    cold_status_identity_case_at(route, fail_sibling, false, false).await;
+    cold_status_identity_case_at(route, fail_sibling, false, false, false).await;
 }
 async fn cold_status_identity_case_at(
     route: &str,
     fail_sibling: bool,
     fail_identity: bool,
     fenced: bool,
+    single_recipient: bool,
 ) {
     use wacore::store::traits::SignalStore;
     use wacore::types::message::AddressingMode;
@@ -2370,7 +2371,11 @@ async fn cold_status_identity_case_at(
             (peer.clone(), new_identity),
             (healthy_jid.clone(), healthy_identity),
         ]),
-        devices: vec![peer.clone(), healthy_jid.clone()],
+        devices: if single_recipient {
+            vec![peer.clone()]
+        } else {
+            vec![peer.clone(), healthy_jid.clone()]
+        },
         bundles: HashMap::from([
             (peer.clone(), bundle_for(&new_peer).await),
             (healthy_jid.clone(), bundle_for(&healthy).await),
@@ -2518,18 +2523,23 @@ async fn failed_status_invalidation_aborts_the_retry_batch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_identity_read_aborts_the_direct_batch() {
-    cold_status_identity_case_at("direct", false, true, false).await;
+    cold_status_identity_case_at("direct", false, true, false, false).await;
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_identity_read_aborts_the_group_batch() {
-    cold_status_identity_case_at("group", false, true, false).await;
+    cold_status_identity_case_at("group", false, true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_identity_read_keeps_the_direct_fence_refusal() {
-    cold_status_identity_case_at("direct", false, true, true).await;
+    cold_status_identity_case_at("direct", false, true, true, false).await;
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_identity_read_keeps_the_group_fence_refusal() {
-    cold_status_identity_case_at("group", false, true, true).await;
+    cold_status_identity_case_at("group", false, true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_identity_read_keeps_the_fence_refusal_for_the_only_recipient() {
+    cold_status_identity_case_at("direct", false, true, true, true).await;
 }

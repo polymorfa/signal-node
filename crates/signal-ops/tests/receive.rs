@@ -273,6 +273,30 @@ fn a_sender_key_carried_in_a_pairwise_message_unlocks_group_traffic() {
         group.content.message.conversation.as_deref(),
         Some("hi group")
     );
+
+    for status_session in [false, true] {
+        let ciphertext = block_on(alice.ops.group_encrypt(
+            GROUP,
+            &alice_addr,
+            &padded(&text("group publication")),
+        ))
+        .unwrap();
+        let request = request(
+            GROUP,
+            &alice_addr,
+            ReceiveKind::SenderKey,
+            &ciphertext,
+            false,
+        );
+        let first = message(block_on(bob.ops.receive_status(request, status_session)).unwrap());
+        assert_eq!(
+            first.content.message.conversation.as_deref(),
+            Some("group publication")
+        );
+        let replay = message(block_on(bob.ops.receive_status(request, !status_session)).unwrap());
+        assert!(replay.redelivered);
+        assert_eq!(replay.receipt_key, first.receipt_key);
+    }
 }
 
 #[test]
