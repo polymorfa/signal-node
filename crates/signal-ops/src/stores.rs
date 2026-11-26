@@ -43,8 +43,57 @@ where
     move |e| SignalProtocolError::BackendError(context, e.into())
 }
 
+// Keep sibling ratchets only when they belong to the accepted identity. A
+// delayed archived message can temporarily change the shared identity row.
+pub(crate) async fn invalidate_sibling_identity<S: SignalStore>(
+    store: &S,
+    key: &str,
+    accepted: &IdentityKey,
+) -> SignalResult<()> {
+    if let Some(bytes) = store
+        .get_session(key)
+        .await
+        .map_err(backend("load sibling session"))?
+    {
+        let record = SessionRecord::deserialize_for_store(&bytes, incarnation())?;
+        if let Some(state) = record.session_state() {
+            let identity = state.remote_identity_key().map_err(|_| {
+                SignalProtocolError::InvalidArgument("invalid sibling session identity".into())
+            })?;
+            if identity.as_ref() == Some(accepted) {
+                return Ok(());
+            }
+        }
+        store
+            .delete_session(key)
+            .await
+            .map_err(backend("delete sibling session"))?;
+    }
+    Ok(())
+}
+
+struct SharedFinalizationError(Arc<SignalProtocolError>);
+impl std::fmt::Display for SharedFinalizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session finalization failed")
+    }
+}
+impl std::fmt::Debug for SharedFinalizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for SharedFinalizationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 pub(crate) struct Stores<S> {
     pub store: Arc<S>,
+    pub status_session: bool,
+    pub finalization_error: Arc<std::sync::Mutex<Option<Arc<SignalProtocolError>>>>,
+    pub pending_identities: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub keys: Arc<DeviceKeys>,
     pub sender_key_locks: Arc<KeyedLocks>,
 }
@@ -53,9 +102,80 @@ impl<S> Clone for Stores<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            status_session: self.status_session,
+            finalization_error: self.finalization_error.clone(),
+            pending_identities: self.pending_identities.clone(),
             keys: self.keys.clone(),
             sender_key_locks: self.sender_key_locks.clone(),
         }
+    }
+}
+
+impl<S> Stores<S> {
+    fn session_key(&self, address: &ProtocolAddress) -> String {
+        if self.status_session {
+            format!("{}_status", address.as_str())
+        } else {
+            address.as_str().to_owned()
+        }
+    }
+    fn begin_identity_write(&self, address: &ProtocolAddress) {
+        let mut pending = self
+            .pending_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending.entry(self.session_key(address)).or_default() += 1;
+    }
+    fn complete_identity_write(&self, address: &ProtocolAddress) {
+        let mut pending = self
+            .pending_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = self.session_key(address);
+        if let Some(count) = pending.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&key);
+            }
+        }
+    }
+
+    fn failed(&self, error: SignalProtocolError) -> SignalProtocolError {
+        let error = Arc::new(error);
+        let mut first = self
+            .finalization_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some(error.clone());
+        }
+        SignalProtocolError::BackendError(
+            "session finalization",
+            Box::new(SharedFinalizationError(error)),
+        )
+    }
+    pub fn ensure_finalized(&self) -> Result<(), crate::error::OpsError> {
+        if let Some(error) = self
+            .finalization_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            // Keep the original source chain, including a lost lease fence.
+            return Err(wacore::store::error::StoreError::Database(Box::new(
+                SharedFinalizationError(error),
+            ))
+            .into());
+        }
+        if !self
+            .pending_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            return Err(crate::error::interrupted_operation());
+        }
+        Ok(())
     }
 }
 
@@ -85,7 +205,11 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
     async fn load_session(&self, address: &ProtocolAddress) -> SignalResult<Option<SessionRecord>> {
         match self
             .store
-            .get_session(address.as_str())
+            .get_session(&if self.status_session {
+                format!("{}_status", address.as_str())
+            } else {
+                address.as_str().to_owned()
+            })
             .await
             .map_err(backend("load_session"))?
         {
@@ -99,7 +223,11 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
 
     async fn has_session(&self, address: &ProtocolAddress) -> SignalResult<bool> {
         self.store
-            .has_session(address.as_str())
+            .has_session(&if self.status_session {
+                format!("{}_status", address.as_str())
+            } else {
+                address.as_str().to_owned()
+            })
             .await
             .map_err(backend("has_session"))
     }
@@ -109,12 +237,49 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
         address: &ProtocolAddress,
         record: SessionRecord,
     ) -> SignalResult<()> {
+        // Only a newly accepted ratchet can replace the sibling identity.
+        // Existing/archived ratchet updates must not discard a newer sibling.
+        // This store boundary is shared by explicit bundles and core fan-out.
+        let sibling = if self.status_session {
+            address.as_str().to_owned()
+        } else {
+            format!("{}_status", address.as_str())
+        };
+        let finalized = async {
+            if let Some(state) = record.session_state() {
+                let base = PublicKey::from_djb_public_key_bytes(state.alice_base_key()?)?;
+                let known = match self.load_session(address).await? {
+                    Some(previous) => {
+                        previous.has_session_state(state.session_version()?, &base)?
+                    }
+                    None => false,
+                };
+                if !known && let Some(identity) = state.remote_identity_key()? {
+                    invalidate_sibling_identity(self.store.as_ref(), &sibling, &identity).await?;
+                }
+            }
+            Ok::<(), SignalProtocolError>(())
+        }
+        .await;
+        if let Err(error) = finalized {
+            return Err(self.failed(error));
+        }
         let mut bytes = Vec::new();
         record.serialize_into_for_store(&mut bytes, incarnation());
         self.store
-            .put_session(address.as_str(), &bytes)
+            .put_session(
+                &if self.status_session {
+                    format!("{}_status", address.as_str())
+                } else {
+                    address.as_str().to_owned()
+                },
+                &bytes,
+            )
             .await
             .map_err(backend("store_session"))
+            .map_err(|error| self.failed(error))?;
+        self.complete_identity_write(address);
+        Ok(())
     }
 }
 
@@ -134,12 +299,19 @@ impl<S: SignalStore + 'static> IdentityKeyStore for Stores<S> {
         address: &ProtocolAddress,
         identity: &IdentityKey,
     ) -> SignalResult<IdentityChange> {
-        let existing = self.get_identity(address).await?;
+        // Core fan-out can drop an error or a lost task. Keep the cohort
+        // uncommittable until the corresponding session write completes.
+        self.begin_identity_write(address);
+        let existing = self
+            .get_identity(address)
+            .await
+            .map_err(|error| self.failed(error))?;
         let key: [u8; 32] = *identity.public_key().public_key_bytes();
         self.store
             .put_identity(address.as_str(), key)
             .await
-            .map_err(backend("save_identity"))?;
+            .map_err(backend("save_identity"))
+            .map_err(|error| self.failed(error))?;
         Ok(match existing {
             Some(previous) if &previous != identity => IdentityChange::ReplacedExisting,
             _ => IdentityChange::NewOrUnchanged,
@@ -282,5 +454,111 @@ impl<S: SignalStore + 'static> SenderKeyStore for Stores<S> {
 
     async fn sender_key_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
         self.sender_key_locks.get(name.cache_key())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore::libsignal::protocol::KeyPair;
+    use wacore_recordstore::{
+        AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore,
+        RecordStore, WriteOp,
+    };
+
+    #[derive(Default)]
+    struct PausedIdentityRecords(MemoryRecordStore);
+    #[async_trait]
+    impl RecordStore for PausedIdentityRecords {
+        async fn get(
+            &self,
+            scope: &str,
+            ns: Namespace,
+            key: &str,
+        ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+            if ns == Namespace::Identity {
+                return std::future::pending().await;
+            }
+            self.0.get(scope, ns, key).await
+        }
+        async fn scan_keys(
+            &self,
+            scope: &str,
+            ns: Namespace,
+            prefix: &str,
+            limit: Option<usize>,
+        ) -> wacore::store::error::Result<Vec<String>> {
+            self.0.scan_keys(scope, ns, prefix, limit).await
+        }
+        async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> wacore::store::error::Result<()> {
+            self.0.write(fence, ops).await
+        }
+    }
+
+    #[test]
+    fn a_cancelled_identity_callback_keeps_the_batch_uncommittable() {
+        futures::executor::block_on(async {
+            let records = Arc::new(PausedIdentityRecords::default());
+            let lease = records
+                .0
+                .acquire("authored-cancelled-identity", "test", 0, 60_000)
+                .await
+                .unwrap()
+                .unwrap();
+            let store = Arc::new(RecordSignalStore::new(
+                records,
+                Arc::new(AesGcmSealer::new(&[7; 32])),
+                lease.fence,
+            ));
+            let ops = crate::SignalOps::create(store).await.unwrap();
+            let stores = ops.stores_over(Arc::new(ops.store().staged())).await;
+            let mut identities = stores.clone();
+            let address = ProtocolAddress::new("111@s.whatsapp.net", 1u32.into());
+            let identity = IdentityKey::new(
+                KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key,
+            );
+            {
+                let future = identities.save_identity(&address, &identity);
+                futures::pin_mut!(future);
+                assert!(futures::poll!(future.as_mut()).is_pending());
+            }
+            assert!(
+                stores.ensure_finalized().unwrap_err().is_fence_lost(),
+                "a lost callback must require a new fenced instance"
+            );
+        });
+    }
+
+    #[test]
+    fn service_classification_keeps_the_actual_finalization_fence_cause() {
+        let lost = wacore_recordstore::FenceLost {
+            scope: "authored-finalization-source".into(),
+            generation: 7,
+        }
+        .into_store_error();
+        let source = SignalProtocolError::BackendError("authored store", Box::new(lost));
+        let error = crate::OpsError::Signal(SignalProtocolError::BackendError(
+            "session finalization",
+            Box::new(SharedFinalizationError(Arc::new(source))),
+        ));
+        assert!(
+            error.is_fence_lost(),
+            "service lost the fence refusal inside its finalization wrapper"
+        );
+    }
+
+    #[test]
+    fn service_classification_does_not_turn_finalization_io_into_fence_loss() {
+        let source = SignalProtocolError::BackendError(
+            "authored store",
+            Box::new(wacore::store::error::StoreError::Io(std::io::Error::other(
+                "authored ordinary I/O",
+            ))),
+        );
+        let error = crate::OpsError::Signal(SignalProtocolError::BackendError(
+            "session finalization",
+            Box::new(SharedFinalizationError(Arc::new(source))),
+        ));
+        assert!(!error.is_fence_lost());
     }
 }

@@ -94,3 +94,9 @@ exact merged source cohorts and owner publication authority remain. No merge,
 deployment, publication, provider configuration or main-only cutover occurs here.
 Rollback must preserve sealed/device/prekey state, event identity and fences;
 never reset keys or weaken verification to fit an older consumer.
+
+## Status publications
+
+This candidate composes the Connection rename with separate status receive handling. The application exposes `status.received` with `connection_id` and `status_scope`. Protocol version 1 retains the additive status operation and duplicate publication classification. Signal sessions, receipt keys and acknowledgment privacy keep their existing semantics.
+
+The workspace operations adapter finalizes sibling identity state when it accepts a new pairwise ratchet. Existing and archived ratchet updates preserve the sibling. Failed local finalization aborts staged direct or group sends and preserves lease refusal through wrapped errors. Prior checks do not establish native provider, PostgreSQL or previous-release retained-state acceptance for this composition.

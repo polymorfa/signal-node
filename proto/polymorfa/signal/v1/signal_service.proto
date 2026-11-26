@@ -99,6 +99,8 @@ message RunnerRequest {
     Resend resend = 17;
     ForgetIdentity forget_identity = 18;
     MigratePnToLid migrate_pn_to_lid = 19;
+    // A distinct operation prevents old services from using the chat ratchet.
+    StatusReceive status_receive = 22;
     PreparePreKeyUpload prepare_pre_key_upload = 20;
     AcknowledgePreKeyUpload acknowledge_pre_key_upload = 21;
   }
@@ -218,7 +220,22 @@ message Receive {
   bytes device_identity = 10;
 }
 
+// StatusReceive must be explicitly implemented. An unsupported service returns
+// CODE_UNSUPPORTED without decrypting, delivering or mutating a chat session.
+// The response uses ServiceResponse.receive and retains the no-plaintext contract.
+message StatusReceive {
+  Receive payload = 1;
+  // "personal", "group" or "channel". This is publication provenance,
+  // never inferred from quoted content or a status mention notification.
+  string status_kind = 2;
+  // Use the sender's separate pairwise status session for pkmsg/msg only.
+  // Identity keys and prekeys remain shared. skmsg keeps its sender-key scope.
+  bool status_session = 3;
+}
+
 message ReceiveResult {
+  // Decrypted publication context for receipts. Empty when unknown.
+  string status_kind = 5;
   bool already_delivered = 1;
   bool redelivered = 2;
   bool sender_key_rejected = 3;

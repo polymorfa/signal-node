@@ -423,6 +423,9 @@ impl<S: ServiceStore> SignalOps<S> {
     pub(crate) async fn stores_over(&self, store: Arc<S>) -> Stores<S> {
         Stores {
             store,
+            status_session: false,
+            finalization_error: Arc::new(std::sync::Mutex::new(None)),
+            pending_identities: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             keys: self.authority.keys.read().await.clone(),
             sender_key_locks: self.authority.sender_key_locks.clone(),
         }
@@ -606,6 +609,10 @@ impl<S: ServiceStore> SignalOps<S> {
         let mut found = Vec::new();
         for ns in [Namespace::Session, Namespace::Identity] {
             for address in self.store.scan_peer_addresses(ns, user).await? {
+                let address = address
+                    .strip_suffix("_status")
+                    .unwrap_or(&address)
+                    .to_owned();
                 if let Some(device) = device_of(&address, user, server) {
                     found.push((address, device));
                 }
@@ -644,7 +651,11 @@ impl<S: ServiceStore> SignalOps<S> {
                     let batch: Vec<Arc<str>> =
                         addresses.iter().map(|a| Arc::from(a.as_str())).collect();
                     let staged = self.store.staged();
-                    staged.delete_sessions_batch(&batch).await?;
+                    let sessions: Vec<Arc<str>> = addresses
+                        .iter()
+                        .flat_map(|a| [Arc::from(a.as_str()), Arc::from(format!("{a}_status"))])
+                        .collect();
+                    staged.delete_sessions_batch(&sessions).await?;
                     staged.delete_identities_batch(&batch).await?;
                     staged.commit().await?;
                     Ok(())
@@ -718,12 +729,16 @@ impl<S: ServiceStore> SignalOps<S> {
                     let mut decided = std::collections::HashSet::new();
                     for (from, to) in &moves {
                         let first = !decided.contains(to);
-                        if let Some(session) = staged.get_session(from).await? {
-                            if first {
-                                staged.put_session(to, &session).await?;
+                        for suffix in ["", "_status"] {
+                            let from_key = format!("{from}{suffix}");
+                            let to_key = format!("{to}{suffix}");
+                            if let Some(session) = staged.get_session(&from_key).await? {
+                                if first {
+                                    staged.put_session(&to_key, &session).await?;
+                                }
+                                staged.delete_session(&from_key).await?;
+                                moved.insert(to.clone());
                             }
-                            staged.delete_session(from).await?;
-                            moved.insert(to.clone());
                         }
                         if let Some(identity) = staged.load_identity(from).await? {
                             if first && staged.load_identity(to).await?.is_none() {
@@ -851,6 +866,19 @@ impl<S: ServiceStore> SignalOps<S> {
         ciphertext: &[u8],
         device_identity: Option<&[u8]>,
     ) -> Result<Decrypted, OpsError> {
+        self.decrypt_into_scoped(staged, sender, kind, ciphertext, device_identity, false)
+            .await
+    }
+
+    pub(crate) async fn decrypt_into_scoped(
+        &self,
+        staged: &Arc<S>,
+        sender: &ProtocolAddress,
+        kind: EncKind,
+        ciphertext: &[u8],
+        device_identity: Option<&[u8]>,
+        status_session: bool,
+    ) -> Result<Decrypted, OpsError> {
         if kind == EncKind::PreKey {
             let identity = *PreKeySignalMessage::try_from(ciphertext)?
                 .identity_key()
@@ -862,6 +890,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 .map_err(OpsError::BundleRefused)?;
         }
         let mut sessions = self.stores_over(staged.clone()).await;
+        sessions.status_session = status_session;
         let mut identities = sessions.clone();
         // libsignal reports a replaced identity for a prekey message but not
         // for an ordinary `msg` that commits a session with another identity,

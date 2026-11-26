@@ -69,7 +69,30 @@ pub async fn handle(
     let fail = |e: OpsError| node.ops_error(connection, &e);
     match op {
         Op::GetIdentity(_) => unreachable!("handled above"),
-        Op::Receive(receive) => self::receive(node, connection, &ops, receive).await,
+        Op::Receive(receive) => self::receive(node, connection, &ops, receive, None, false).await,
+        Op::StatusReceive(request) => {
+            let receive = request
+                .payload
+                .ok_or_else(|| invalid("status payload is required"))?;
+            let valid = match request.status_kind.as_str() {
+                "personal" => receive.chat == "status@broadcast",
+                "group" => receive.chat.ends_with("@g.us"),
+                "channel" => receive.chat.ends_with("@newsletter"),
+                _ => false,
+            };
+            if !valid {
+                return Err(invalid("status scope does not match publication origin"));
+            }
+            self::receive(
+                node,
+                connection,
+                &ops,
+                receive,
+                Some(&request.status_kind),
+                request.status_session,
+            )
+            .await
+        }
         Op::GeneratePreKeys(request) => {
             let keys = ops
                 .generate_prekeys(&TokioRuntime, request.count)
@@ -243,6 +266,8 @@ async fn receive(
     connection: &Arc<ActiveConnection>,
     ops: &crate::node::Ops,
     receive: proto::Receive,
+    status_kind: Option<&str>,
+    status_session: bool,
 ) -> Result<ServiceResponse, proto::Error> {
     let sender = jid(&receive.sender, "sender")?;
     let address = sender.to_protocol_address();
@@ -254,31 +279,37 @@ async fn receive(
     };
     let padding_version = u8::try_from(receive.padding_version)
         .map_err(|_| invalid("padding_version out of range"))?;
-    let received = ops
-        .receive(ReceiveRequest {
-            chat: &receive.chat,
-            sender: &address,
-            kind,
-            ciphertext: &receive.ciphertext,
-            padding_version,
-            is_from_me: receive.is_from_me,
-            device_identity: (!receive.device_identity.is_empty())
-                .then_some(receive.device_identity.as_slice()),
-        })
-        .await
-        .map_err(|e| {
-            let error = receive_error(node, connection, &e);
-            tracing::info!(
-                connection = %connection.id,
-                message_id = %receive.message_id,
-                kind = %receive.kind,
-                code = error.code_enum().as_str_name(),
-                "receive failed"
-            );
-            error
-        })?;
+    let request = ReceiveRequest {
+        chat: &receive.chat,
+        sender: &address,
+        kind,
+        ciphertext: &receive.ciphertext,
+        padding_version,
+        is_from_me: receive.is_from_me,
+        device_identity: (!receive.device_identity.is_empty())
+            .then_some(receive.device_identity.as_slice()),
+    };
+    let result = if status_kind.is_some() {
+        ops.receive_status(request, status_session).await
+    } else {
+        ops.receive(request).await
+    };
+    let received = result.map_err(|e| {
+        let error = receive_error(node, connection, &e);
+        tracing::info!(
+            connection = %connection.id,
+            message_id = %receive.message_id,
+            kind = %receive.kind,
+            code = error.code_enum().as_str_name(),
+            "receive failed"
+        );
+        error
+    })?;
     let message = match received {
-        Received::AlreadyDelivered { receipt_key } => {
+        Received::AlreadyDelivered {
+            receipt_key,
+            group_status_wrapper,
+        } => {
             let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
                 let cutoff = crate::node::now_ms()
                     .saturating_sub(node.cfg.decrypt_buffer_retention.as_millis() as u64);
@@ -296,6 +327,13 @@ async fn receive(
                 ));
             }
             return respond(Out::Receive(ReceiveResult {
+                status_kind: publication_kind(
+                    &receive,
+                    status_kind,
+                    group_status_wrapper == Some(true),
+                )
+                .unwrap_or("")
+                .to_owned(),
                 already_delivered: true,
                 app_state_key_share,
                 ..Default::default()
@@ -303,6 +341,12 @@ async fn receive(
         }
         Received::Message(message) => message,
     };
+
+    let status_kind = publication_kind(
+        &receive,
+        status_kind,
+        message.content.message.group_status_message_v2.is_set(),
+    );
 
     // Explicit operator consent in addition to the pinned core own-device gate.
     let app_state_key_share = if node.cfg.share_app_state_keys && receive.is_from_me {
@@ -314,7 +358,7 @@ async fn receive(
     } else {
         Vec::new()
     };
-    if let Some(event) = event_for(node, connection, &receive, &message) {
+    if let Some(event) = event_for(node, connection, &receive, &message, status_kind) {
         let kind = event.kind;
         if let Err(e) = node.delivery.deliver(event).await {
             tracing::info!(
@@ -345,6 +389,7 @@ async fn receive(
         .await
         .map_err(|e| node.ops_error(connection, &e))?;
     respond(Out::Receive(ReceiveResult {
+        status_kind: status_kind.unwrap_or("").to_owned(),
         already_delivered: false,
         redelivered: message.redelivered,
         sender_key_rejected: message.sender_key_rejected,
@@ -370,21 +415,38 @@ pub fn event_id(connection_id: &str, receipt_key: &str) -> String {
 /// The application event for a received message, or `None` when the
 /// message is protocol-only (sender keys, app-state keys, peer data
 /// operations) or is history and history delivery is off.
+fn publication_kind<'a>(
+    receive: &proto::Receive,
+    explicit: Option<&'a str>,
+    group_wrapper: bool,
+) -> Option<&'a str> {
+    explicit
+        .or_else(|| (receive.chat.ends_with("@g.us") && group_wrapper).then_some("group"))
+        .or_else(|| (receive.chat == "status@broadcast").then_some("personal"))
+}
+
 fn event_for(
     node: &Node,
     connection: &ActiveConnection,
     receive: &proto::Receive,
     received: &wacore_signal_ops::ReceivedMessage,
+    status_kind: Option<&str>,
 ) -> Option<Event> {
     let content = &received.content;
     if content.is_skdm_only {
         return None;
     }
+    let status_kind = publication_kind(
+        receive,
+        status_kind,
+        content.message.group_status_message_v2.is_set(),
+    );
     let id = event_id(&connection.id, &received.receipt_key);
     let base = |kind: &'static str| Event {
         id: id.clone(),
         kind,
         connection_id: connection.id.clone(),
+        status_scope: status_kind.map(str::to_owned),
         chat: receive.chat.clone(),
         sender: receive.sender.clone(),
         sender_alt: Some(receive.sender_alt.clone()).filter(|s| !s.is_empty()),
@@ -448,9 +510,18 @@ fn event_for(
     } else {
         &content.message
     };
+    let display_message = if status_kind == Some("group") {
+        wa_message
+            .group_status_message_v2
+            .as_option()
+            .and_then(|wrapped| wrapped.message.as_option())
+            .unwrap_or(wa_message)
+    } else {
+        wa_message
+    };
     Some(Event {
-        text: message::text_of(wa_message),
-        media: message::media_of(wa_message),
+        text: message::text_of(display_message),
+        media: message::media_of(display_message),
         message_proto: base64_of(&message::encode(wa_message)),
         history: content
             .protocol_message
@@ -458,7 +529,11 @@ fn event_for(
             .and_then(|p| p.history_sync_notification.as_ref())
             .filter(|_| node.cfg.deliver_history && receive.is_from_me)
             .map(message::history_descriptor),
-        ..base("message")
+        ..base(if status_kind.is_some() {
+            "status.received"
+        } else {
+            "message"
+        })
     })
 }
 

@@ -374,6 +374,7 @@
             "type": "string",
             "enum": [
               "message",
+              "status.received",
               "history.sync"
             ]
           },
@@ -416,6 +417,15 @@
           },
           "history": {
             "$ref": "#/components/schemas/HistoryDescriptor"
+          },
+          "status_scope": {
+            "type": "string",
+            "enum": [
+              "personal",
+              "group",
+              "channel"
+            ],
+            "description": "Status publication audience. Absent for ordinary messages and history."
           }
         }
       },

@@ -513,9 +513,12 @@ impl<S: ServiceStore> SignalOps<S> {
                     pre_encoded: None,
                 },
             )
-            .await
-            .map_err(send_error)?;
+            .await;
 
+            // Fan-out can report no ciphertext after a store callback fails.
+            // Preserve the typed store error before classifying that result.
+            sessions.ensure_finalized()?;
+            let prepared = prepared.map_err(send_error)?;
             let encoded = waproto::codec::message_to_vec(message);
             staged
                 .put_aux(
@@ -873,6 +876,7 @@ impl<S: ServiceStore> SignalOps<S> {
                             )
                             .await?;
                     }
+                    sessions.ensure_finalized()?;
                     let encoded = waproto::codec::message_to_vec(message);
                     staged
                         .put_aux(
@@ -1127,7 +1131,7 @@ impl<S: ServiceStore> SignalOps<S> {
             };
             let mut sessions = self.stores_over(staged.clone()).await;
             let mut identities = sessions.clone();
-            let node = prepare_pairwise_retry_stanza(
+            let prepared = prepare_pairwise_retry_stanza(
                 &mut sessions,
                 &mut identities,
                 PairwiseRetryRequest {
@@ -1141,8 +1145,9 @@ impl<S: ServiceStore> SignalOps<S> {
                     pre_encoded: None,
                 },
             )
-            .await
-            .map_err(send_error)?;
+            .await;
+            sessions.ensure_finalized()?;
+            let node = prepared.map_err(send_error)?;
             staged.commit().await?;
             wacore_binary::marshal(&node)
                 .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))
